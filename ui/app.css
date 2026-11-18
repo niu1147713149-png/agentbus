@@ -640,6 +640,21 @@ pre.cmd.log { max-height: 180px; overflow: auto; background: var(--surface-3); c
 .brain-btn.set em { color: var(--accent-2); }
 .brain-btn[disabled] { cursor: default; opacity: .85; }
 .pop.bp { width: 280px; padding: 12px; border-radius: 20px; overflow: visible; max-height: none; }
+.pop.brain-editor { width: 390px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow-y: auto; padding: 18px; }
+.brain-current { font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; margin: 10px 0 16px; }
+.brain-current strong { color: var(--ink-2); font-weight: 500; }
+.brain-form { display: grid; gap: 8px; }
+.brain-form > label { font-weight: 600; font-size: 13px; }
+.brain-form > input, .brain-form > select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-3); color: var(--ink); font-size: 13px; }
+.brain-form > input:focus, .brain-form > select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.brain-form > p { margin: 0; line-height: 1.6; }
+.brain-model-help { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--ink-3); margin-bottom: 7px; }
+.brain-model-help button { color: var(--accent-2); flex-shrink: 0; }
+.brain-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.ch-brains { display: flex; flex-wrap: wrap; gap: 10px 20px; margin-top: 9px; }
+.ch-brains:empty { display: none; }
+.ch-brains > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ch-brains > div > span { color: var(--ink-3); font-size: 12px; }
 .bp-top { display: flex; align-items: center; gap: 8px; }
 .bp-ic { width: 28px; height: 28px; display: grid; place-items: center; color: var(--ink-3); flex: none; }
 .bp-ic .i { width: 17px; height: 17px; }
@@ -1089,7 +1104,9 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .cm.sys { align-self: center; max-width: 90%; font-size: 12px; color: var(--ink-3); background: transparent; display: block; text-align: center; }
 .ch-run { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 16px; }
 .ch-run:not(:empty) { padding: 8px 16px 0; }
-.ch-run .pill { gap: 5px; }
+.ch-run .pill { gap: 5px; max-width: 100%; height: auto; min-height: 22px; }
+.ch-run .ch-detail { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.ch-run time { flex: none; font-variant-numeric: tabular-nums; }
 .ch-in { position: relative; border-top: 1px solid var(--line); padding: 10px 14px 12px; }
 .ch-quick { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .ch-quick .chip { height: 26px; font-size: 12px; cursor: pointer; }

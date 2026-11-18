@@ -427,10 +427,10 @@ def brain_brief(cfg, aid, a):
     """名牌上的大脑：用的模型 + 思考强度；能不能在这里换。"""
     opts = brains.options(a)
     mine = brains.chosen(cfg, aid)
-    if not opts["models"] and not opts.get("current"):
+    if not opts["models"] and not opts.get("current") and not opts.get("custom_model"):
         return None
     m, e, info = brains.effective(mine, opts)
-    return {"label": brains.label(mine, opts), "set": bool(mine), "switch": opts["switch"], "model": m, "effort": e,
+    return {"label": brains.label(mine, opts), "set": bool(mine), "switch": opts["switch"], "model": m, "effort": e, "custom_model": bool(opts.get("custom_model")),
             "name": info.get("name") or m.split("/")[-1], "effort_name": brains.EFFORT_NAME.get(e, e or "")}
 
 
@@ -443,6 +443,24 @@ def brain_options(aid, fresh=False):
     o["chosen"] = brains.chosen(cfg, aid)
     o["names"] = brains.EFFORT_NAME
     return o
+
+
+def set_brain(aid, data):
+    from config import CONFIG, update_json
+    a = agents_dict(load_config()).get(aid)
+    if not a:
+        raise ValueError("不认识的 agent")
+    choice = brains.validate_choice(data, brains.options(a))
+
+    def change(cfg):
+        if choice:
+            cfg.setdefault("brains", {})[aid] = choice
+        else:
+            cfg.setdefault("brains", {}).pop(aid, None)
+
+    update_json(CONFIG, change)
+    _cache.clear()
+    return {"ok": True, "chosen": choice}
 
 
 def make_clone(base, name=None):
@@ -522,11 +540,7 @@ def remove_clone(cid):
 
 
 def _alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
+    return pf.pid_alive(pid)
 
 
 def _record_lost(r):
@@ -546,14 +560,26 @@ def _record_lost_now(r):
     except SystemExit:
         return
     now = time.time()
-    text = f"（派活进程意外没了，{r.get('agent')} 没交回复：可能被杀掉、或电脑睡眠/重启。去产出目录看看做到哪了。）"
+    status = "stopped" if r.get("cancel") else "interrupted"
+    text = (f"（这单已被手动停止：{r.get('agent')} 没做完。）" if r.get("cancel") else
+            f"（派活进程意外没了，{r.get('agent')} 没交回复：可能被杀掉、或电脑睡眠/重启。去产出目录看看做到哪了。）")
     ledger_add({"id": r["id"], "project": r.get("project"), "batch": r.get("batch") or "", "agent": r.get("agent"), "billing": r.get("billing"),
                 "tag": r.get("tag"), "task": r.get("task"), "start": r.get("start") or now, "end": now, "seconds": round(now - (r.get("start") or now)),
-                "ok": False, "lost": True, "frm": r.get("frm") or "claude", "reply": text, "cost": {"ok": False, "note": "进程没了，没查额度"}, "conv": r.get("conv") or ""})
+                "ok": False, "lost": True, "status": status, "frm": r.get("frm") or "claude", "reply": text, "cost": {"ok": False, "note": "进程没了，没查额度"}, "conv": r.get("conv") or ""})
     with open(Path(bus) / "board.jsonl", "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"t": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": "reply", "frm": r.get("agent"), "to": r.get("frm") or "claude",
                              "text": text, "run": r.get("run"), "tag": r.get("tag"), "batch": r.get("batch"), "ok": False, "conv": r.get("conv") or ""},
                             ensure_ascii=False) + "\n")
+    import chat
+    import mcp_server
+    jid = r.get("job")
+    if not jid:  # 旧版 running 记录没有 job id，按派活进程关联
+        jid = next((f.stem for f in (HOME / "jobs").glob("*.json")
+                    if load_json(f, {}).get("pid") == r.get("pid")), None)
+    mcp_server.finish_job(jid, status, text, r.get("run"))
+    channel = r.get("channel") or next((c["name"] for c in chat.channels() if chat.conv_of(c["name"]) == r.get("conv")), None)
+    if channel:
+        chat.append(channel, "agentbus", text, system=True, run=r.get("run"))
 
 
 def build_rooms(running, sess, agents, cfg):
@@ -776,11 +802,9 @@ def state(project_name=None):
     running = {}
     for f in (HOME / "running").glob("*.json"):
         r = load_json(f, {})
-        try:
-            os.kill(int(r.get("pid") or 0), 0)
-        except (OSError, ValueError):  # 派活的进程已经没了（被杀、机器重启）：记一条“没做成”，派活的人才知道
-            f.unlink(missing_ok=True)
+        if not pf.pid_alive(r.get("pid")):  # 派活的进程已经没了（被杀、机器重启）：记一条“没做成”，派活的人才知道
             _record_lost(r)
+            f.unlink(missing_ok=True)
             continue
         if not r.get("title"):  # 老记录没有短标题：现场提炼一个（悬浮窗胶囊只显示它）
             from agentbus import short_title
@@ -1025,8 +1049,7 @@ def playbook_state():
 
 def _job_alive(f):
     try:
-        os.kill(int(json.loads(f.read_text())["pid"]), 0)
-        return True
+        return pf.pid_alive(json.loads(f.read_text())["pid"])
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return False
 
@@ -1477,7 +1500,7 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError:
                 return self._json({"error": "Content-Length 不对"}, 400)
             if n < 0 or n > (50 if path == "/api/chat/upload" else 4) * 1024 * 1024:
-                return self._json({"error": "内容太大" + ("（上限 50MB，大文件直接在消息里写路径）" if path == "/api/chat/upload" else "")}, 413)
+                return self._json({"error": "内容太大" + ("（单个附件上限 50MB）" if path == "/api/chat/upload" else "")}, 413)
             self.connection.settimeout(30)
             try:
                 self._body = self.rfile.read(n)
@@ -1564,10 +1587,12 @@ class Handler(SimpleHTTPRequestHandler):
             if not chat.valid(ch):
                 return self._json({"error": "频道名不对"}, 400)
             mt = chat.meta(ch)
-            return self._json({"channels": chat.channels(), "channel": ch, "messages": chat.read(ch, int(q.get("n") or 200)),
-                               "meta": {k: mt.get(k) for k in ("mode", "duty", "members", "rounds", "compressions")}, "talking": bool(mt.get("talk_pid") and _alive(mt["talk_pid"])),
-                               "usage": chat.usage(ch), "talk_members": chat.talk_members(ch), "running": len(chat.running(ch)),
-                               "duty_now": chat.resolve_duty(mt.get("duty")), "limits": chat.lim(), "max_rounds": chat.TALK_ROUNDS})
+            tasks = chat.running(ch)
+            return self._json({"channels": chat.channels(), "channel": ch, "messages": chat.with_job_status(chat.read(ch, int(q.get("n") or 200))),
+                               "meta": {k: mt.get(k) for k in ("mode", "duty", "members", "rounds", "compressions", "project", "handoff_mode", "relay_hops")}, "cwd": chat.workspace(ch)[1], "talking": bool(mt.get("talk_pid") and _alive(mt["talk_pid"])),
+                               "usage": chat.usage(ch), "talk_members": chat.talk_members(ch), "running": len(tasks),
+                               "running_tasks": [{k: r.get(k) for k in ("agent", "start", "queued", "title", "progress", "cwd", "job")} for r in tasks],
+                               "duty_now": chat.resolve_duty(mt.get("duty")), "limits": chat.channel_limits(ch), "max_rounds": chat.TALK_ROUNDS})
         if u.path == "/api/connectors":  # 各家 agent 的接入方式：装没装、钩子挂没挂、手动配置、接入口令
             import connectors
             return self._json(connectors.status())
@@ -1576,8 +1601,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(update.check(q.get("fresh") == "1"))
         if u.path == "/api/chat/file":  # 附件预览：只给附件目录里的文件
             import chat
-            f = Path(q.get("p") or "").resolve()
-            if chat.FILES.resolve() not in f.parents or not f.is_file():
+            from chat_attachments import managed_upload
+            try:
+                f = managed_upload(q.get("p") or "", chat.FILES)
+            except (OSError, ValueError, RuntimeError):
                 return self._json({"error": "不行"}, 403)
             # 只有普通位图在页面里直接显示；HTML、SVG 等能带脚本的一律当下载，并用沙箱 CSP 兜底，免得它以本服务的身份调接口
             ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}.get(f.suffix.lower())
@@ -1643,7 +1670,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._allowed():
             return self._deny()
         u = urlparse(self.path)
-        if u.path == "/api/chat/upload":  # 聊天室附件：原样存进附件目录，返回完整路径（发给队员的就是这个路径）
+        if u.path == "/api/chat/upload":  # 保留原始字节；发送时用此引用绑定附件
             import chat
             from urllib.parse import unquote
             raw = self.headers.get("X-Name") or "file"
@@ -1651,11 +1678,13 @@ class Handler(SimpleHTTPRequestHandler):
                 raw = raw.encode("latin-1").decode("utf-8")
             except (UnicodeEncodeError, UnicodeDecodeError):
                 pass
-            name = re.sub(r"[\\/:*?\"<>|\n]", "_", unquote(raw))[-80:] or "file"
+            name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", unquote(raw))[-80:].rstrip(" .") or "file"
             chat.FILES.mkdir(parents=True, exist_ok=True)
-            f = chat.FILES / f"{time.strftime('%m%d-%H%M%S')}-{name}"
-            f.write_bytes(self._body)
-            return self._json({"path": str(f), "name": name, "image": f.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic")})
+            import uuid
+            f = chat.FILES / f"{time.strftime('%m%d-%H%M%S')}-{uuid.uuid4().hex}-{name}"
+            with f.open("xb") as upload:
+                upload.write(self._body)
+            return self._json({"path": str(f), "name": name, "uploaded": True, "image": f.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic")})
         try:
             data = json.loads(self._body or b"{}")
         except json.JSONDecodeError:
@@ -1705,17 +1734,29 @@ class Handler(SimpleHTTPRequestHandler):
             text = (data.get("text") or "").strip()
             if not text:
                 return self._json({"error": "写点内容"}, 400)
-            files = [x for x in data.get("files") or [] if isinstance(x, dict) and x.get("path")][:10]
+            from chat_attachments import managed_upload
+            files = data.get("files", [])
+            if not isinstance(files, list) or len(files) > 10:
+                return self._json({"error": "每条消息最多可附 10 个文件"}, 400)
+            try:
+                for x in files:
+                    managed_upload(x["path"], chat.FILES)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                return self._json({"error": "附件不可用，请用回形针重新选择文件"}, 400)
             msg, jobs = chat.send(data.get("channel") or "大厅", text, cwd=data.get("cwd") or None, files=files)
             _cache.clear()
             return self._json({"ok": True, "message": msg, "jobs": jobs})
         if u.path == "/api/chat/settings":  # 频道设置：模式（派活 / 群聊）、值班的人、群聊成员和轮数
             import chat
             ch = data.get("channel") or "大厅"
-            kw = {k: data[k] for k in ("mode", "duty", "members", "rounds") if k in data}
+            kw = {k: data[k] for k in ("mode", "duty", "members", "rounds", "project") if k in data}
+            if kw.get("project") and kw["project"] not in projects():
+                return self._json({"error": "没有这个项目，请先登记项目文件夹"}, 400)
             if "rounds" in kw:
                 kw["rounds"] = max(1, min(chat.TALK_ROUNDS, int(kw["rounds"] or 1)))
             old = chat.meta(ch)
+            if "project" in kw and kw["project"] != (old.get("project") or "") and (chat.running(ch) or (old.get("talk_pid") and _alive(old["talk_pid"]))):
+                return self._json({"error": "本频道仍在执行，请结束后再切换项目文件夹"}, 409)
             chat.set_meta(ch, **kw)
             if kw.get("mode") and kw["mode"] != old.get("mode"):  # 切了模式：在群里说清楚之后会怎样
                 names = {k: v.get("name", k) for k, v in agents_dict(load_config()).items()}
@@ -1746,6 +1787,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not chat.valid(name):
                 return self._json({"error": "名字里不能有 : 或开头的点"}, 400)
             chat.append(name, "agentbus", f"频道「{name}」建好了，@ 队员就能派活。", system=True)
+            chat.set_meta(name, project=current_project())
             return self._json({"ok": True})
         if u.path == "/api/session/new":  # 钩子报来的新对话窗口：悬浮窗问主人要不要接入 bus
             if data.get("conv"):
@@ -2020,14 +2062,10 @@ class Handler(SimpleHTTPRequestHandler):
             lst = cfg["roster"][place]
             lst.insert(idx if isinstance(idx, int) else len(lst), aid)
         elif u.path == "/api/brain":
-            aid = data.get("agent")
-            if aid not in agents_dict(cfg):
-                return self._json({"error": "不认识的 agent"}, 400)
-            b = {k: data[k] for k in ("model", "effort") if data.get(k)}
-            if b:
-                cfg.setdefault("brains", {})[aid] = b
-            else:
-                cfg.setdefault("brains", {}).pop(aid, None)  # 都不填 = 回到它自己的默认
+            try:
+                return self._json(set_brain(data.get("agent"), data))
+            except ValueError as error:
+                return self._json({"error": str(error)}, 400)
         elif u.path == "/api/lead":
             if data.get("agent") not in agents_dict(cfg):
                 return self._json({"error": "不认识的 agent"}, 400)

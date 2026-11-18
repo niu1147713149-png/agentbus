@@ -126,6 +126,7 @@ fn show_main(app: &AppHandle, page: Option<&str>) {
     }
     let url: tauri::Url = format!("{URL}{hash}").parse().unwrap();
     if let Ok(w) = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+        .disable_drag_drop_handler() // Let the chat uploader receive HTML5 File objects, not local paths.
         .title("agentbus")
         .inner_size(1360.0, 900.0)
         .min_inner_size(420.0, 560.0)

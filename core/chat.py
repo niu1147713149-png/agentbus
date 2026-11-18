@@ -2,7 +2,7 @@
 循环保护（agent 之间互相 @ 最多接力几次）；叫醒 agent 不用往终端里打字，而是走 agentbus 自己的派活（agentbus ask）。
 
   在群里 @某个队员 → 后台派活给它（带上群里最近几条当上下文）→ 它的回复自动发回群里；回复里再 @别人就接力派下去。
-  @Claude：Claude 不接派活，消息转给 Claude 办公室（它下次干活时在回音里看到）。
+  Claude 解封后也可以接派活；所有队员使用频道绑定的项目目录。
   不需要主位：主人直接在消息窗口里就能给任何队员派活。主界面和悬浮窗用的是同一个接口。
 消息存在 ~/.agentbus/chat/<频道>.jsonl。
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 from config import HOME, agents_dict, load_config, load_json, save_json, sealed
 
 CHAT = HOME / "chat"
-FILES = CHAT / "files"  # 附件（粘贴的图片、选的文件）放这里，消息里给队员的是这里的完整路径
+FILES = CHAT / "files"  # 原始上传存储；队员收到的是本次任务的正文或项目内副本
 MAX_HOPS = 4          # agent 之间互相 @ 最多接力几次（主人 @ 的不算）
 CONTEXT_CHARS = 8000  # 派活 / 群聊时带上的上下文最多多少字（压缩要点 + 最近的消息）
 COMPRESS_AT = 16000   # 没压缩过的部分超过这么多字，后台把旧消息压成要点
@@ -56,6 +56,8 @@ def resolve_duty(duty):
     if duty and duty != "auto" and duty in agents:
         return duty
     for aid, a in agents.items():
+        if a.get("hidden"):
+            continue
         if a.get("api") and a.get("run"):
             return aid
     from config import active_lead
@@ -116,12 +118,20 @@ def append(channel, frm, text, **extra):
     return msg
 
 
+def with_job_status(messages):
+    import mcp_server
+    return [dict(m, task_state={k: v for k, v in mcp_server.job_snapshot(m["job"]).items() if k != "reply"})
+            if m.get("job") else m for m in messages]
+
+
 def mentions(text, cfg=None):
     """消息里 @ 了谁：认 agent id 和名字（@GPT、@codex、@zcode、@小深…），@所有人 = 战备里的所有队员。"""
     cfg = cfg or load_config()
     agents = agents_dict(cfg)
     keys = []
     for aid, a in agents.items():
+        if a.get("hidden"):
+            continue
         for k in {aid, a.get("name") or aid}:
             keys.append((k.lower(), aid))
     keys.sort(key=lambda kv: -len(kv[0]))  # 长的先认：“GPT 2号”优先于“GPT”
@@ -132,7 +142,7 @@ def mentions(text, cfg=None):
             from config import active_lead
             own = (cfg.get("office_lineups") or {}).get(active_lead(cfg) or "")
             for aid in ((own or {}).get("office") or cfg["roster"]["office"])[:6]:
-                if aid not in out and not sealed(agents.get(aid) or aid):
+                if aid not in out and not agents.get(aid, {}).get("hidden") and not sealed(agents.get(aid) or aid):
                     out.append(aid)
             continue
         for k, aid in keys:
@@ -143,7 +153,7 @@ def mentions(text, cfg=None):
 
 
 def _line(m, names):
-    att = "".join(f"\n  （附件：{x['path']}）" for x in m.get("files") or [])
+    att = "".join(f"\n  （附件：{x.get('name') or Path(x['path']).name}）" for x in m.get("files") or [])
     return f"[{time.strftime('%m-%d %H:%M', time.localtime(m['t']))}] {names.get(m['frm'], m['frm'])}：{m['text']}{att}"
 
 
@@ -224,10 +234,11 @@ def compress(channel, force=False):
 
 def running(channel):
     """这个频道现在在跑的活。"""
+    import pf
     out = []
     for f in (HOME / "running").glob("*.json"):
         r = load_json(f, {})
-        if (r.get("conv") or "").startswith(conv_of(channel)):
+        if (r.get("conv") or "").startswith(conv_of(channel)) and pf.pid_alive(r.get("pid")):
             out.append(dict(r, _file=str(f)))  # 停止时要写“已取消”、5 秒后重读执行器进程
     return out
 
@@ -237,20 +248,62 @@ def conv_of(channel):
     return "chat-" + hashlib.md5(channel.encode()).hexdigest()[:7]  # 12 位，一个频道一个，派活记录和账单按它分
 
 
+def workspace(channel, cwd=None):
+    """频道固定到项目；显式目录优先，接力时沿用发起任务的目录。"""
+    from config import project, project_of_dir
+    name = project_of_dir(cwd) if cwd else meta(channel).get("project")
+    name, root, _, _ = project(name)
+    return name, str(root)
+
+
+def channel_limits(channel):
+    limits = dict(lim())
+    value = meta(channel).get("relay_hops")
+    if value is not None:
+        limits["hops"] = max(1, min(32, int(value)))
+    return limits
+
+
+def handoff_targets(channel, text, frm, cfg):
+    """正式交付频道只允许最后一行显式交接；审核正文提到队员不会重复派单。"""
+    if frm == "user" or meta(channel).get("handoff_mode") != "single":
+        return mentions(text, cfg)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    handoffs = [line for line in lines if re.match(r"^交接[：:]", line)]
+    if not handoffs:
+        return []
+    match = re.fullmatch(r"交接[：:]\s*@([A-Za-z0-9_-]+)\s+(.+)", lines[-1])
+    if len(handoffs) != 1 or not match:
+        raise ValueError("每条回复只能在最后一行交接一次：交接：@队员ID 任务ID、阶段、版本和下一步")
+    aid = match[1].lower()
+    agents = agents_dict(cfg)
+    members = meta(channel).get("members") or cfg["roster"]["office"]
+    if aid not in members or aid not in agents or agents[aid].get("hidden") or aid == frm:
+        raise ValueError("交接对象必须是本频道的另一位队员")
+    if mentions(lines[-1], cfg) != [aid]:
+        raise ValueError("交接行只能点名一位队员；请由其汇总意见后再交下一位")
+    return [aid]
+
+
 def send(channel, text, frm="user", hops=0, cwd=None, files=None):
     """发一条消息。派活模式：@ 到的队员各派一单（没 @ 人就交给值班的）；群聊模式：主人一句话，队员轮流接着聊。
     返回 (消息, [派出去的 job id])。"""
-    cfg = load_config()
-    L = lim()
+    project_name, cwd = workspace(channel, cwd)
+    cfg = load_config(project_name)
+    L = channel_limits(channel)
     text = text[:L["max_text"]]
     mt = meta(channel)
     msg = append(channel, frm, text, hops=hops, files=files or [])
     jobs = []
-    if frm != "user" and hops >= L["hops"]:
+    try:
+        who = handoff_targets(channel, text, frm, cfg)
+    except ValueError as error:
+        append(channel, "agentbus", f"⏸ 交接未派出：{error}。请修正后重新交接。", system=True)
+        return msg, jobs
+    if who and frm != "user" and hops >= L["hops"]:
         append(channel, "agentbus", f"⏸ 队员之间已经接力了 {hops} 次，先停一下，等主人看看（主人 @ 谁都会继续）。", system=True)
         return msg, jobs
     agents = agents_dict(cfg)
-    who = mentions(text, cfg)
     if frm == "user" and mt["mode"] == "talk" and not who:  # 群聊：没点名就让成员轮流聊
         start_talk(channel, msg["id"], cwd)
         return msg, jobs
@@ -270,7 +323,7 @@ def _wait_registered(jid, timeout=6):
     """等刚派出去的这单登记进 running（派活进程起来要一两秒），这样下一次准入能数到它。"""
     import mcp_server
     try:
-        pid = json.loads((mcp_server.JOBS / f"{jid}.json").read_text()).get("pid")
+        pid = json.loads((mcp_server.JOBS / f"{jid}.json").read_text("utf-8")).get("pid")
     except (OSError, ValueError):
         return
     end = time.time() + timeout
@@ -309,14 +362,17 @@ def _dispatch_all(channel, who, agents, text, frm, hops, cwd, files, L):
 def dispatch(channel, aid, text, frm, hops, cwd=None, files=None):
     import mcp_server
     names = {k: v.get("name", k) for k, v in agents_dict(load_config()).items()}
-    att = "".join(f"\n附件：{x['path']}" for x in files or [])
-    task = (f"【agentbus 聊天室 · 频道「{channel}」】{('主人' if frm == 'user' else names.get(frm, frm))} 在群里找你：\n{text}{att}\n\n"
+    task = (f"【agentbus 聊天室 · 频道「{channel}」】{('主人' if frm == 'user' else names.get(frm, frm))} 在群里找你：\n{text}\n\n"
             f"群里最近的消息（参考上下文）：\n{context(channel)}\n\n"
             "要求：按这条消息把事做完；你最后的回复会原样发回群里，所以写给大家看，简短说清做了什么、产出在哪。"
             "需要别的队员接着做，就在回复里 @ 他（比如 @GPT），他会被叫醒接力。")
     env = {"AGENTBUS_CHAT": channel, "AGENTBUS_CHAT_HOPS": str(hops + (0 if frm == "user" else 1)), "AGENTBUS_CONV": conv_of(channel),
            "AGENTBUS_SELF": frm if frm != "user" else "user"}
-    args = {"agent": aid, "task": task, "tag": None, "new": True}
+    env["AGENTBUS_CHAT_FILES"] = (os.environ.get("AGENTBUS_CHAT_FILES", "[]")
+                                  if frm != "user" and os.environ.get("AGENTBUS_CHAT") == channel
+                                  else attachment_refs(files))
+    project_name, cwd = workspace(channel, cwd)
+    args = {"agent": aid, "task": task, "tag": None, "new": True, "project": project_name}
     jid = mcp_server.start_job(args, env_extra=env, cwd=cwd)
     append(channel, "agentbus", f"⏳ {names.get(aid, aid)} 接活了", system=True, job=jid, agent=aid)
     return jid
@@ -324,14 +380,14 @@ def dispatch(channel, aid, text, frm, hops, cwd=None, files=None):
 
 # ---------- 群聊（头脑风暴）：主人一句话，成员按顺序挨个读群里的内容接着聊 ----------
 def talk_members(channel):
-    cfg = load_config()
+    cfg = load_config(meta(channel).get("project"))
     agents = agents_dict(cfg)
     ms = [m for m in meta(channel).get("members") or [] if m in agents]
     if not ms:  # 没选就用主位办公室战备里的前 4 位
         from config import active_lead
         own = (cfg.get("office_lineups") or {}).get(active_lead(cfg) or "")
         ms = ((own or {}).get("office") or cfg["roster"]["office"])[:4]
-    return [m for m in ms if agents.get(m, {}).get("run") and not sealed(agents.get(m, {})) and agents.get(m, {}).get("billing") != "manual"]
+    return [m for m in ms if agents.get(m, {}).get("run") and not agents[m].get("hidden") and not sealed(agents.get(m, {})) and agents.get(m, {}).get("billing") != "manual"]
 
 
 def start_talk(channel, msg_id, cwd=None):
@@ -347,19 +403,18 @@ def start_talk(channel, msg_id, cwd=None):
 
 
 def _alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    import pf
+    return pf.pid_alive(pid)
 
 
 def _start_talk(channel, msg_id, cwd=None):
     import subprocess
     import pf
     (CHAT / f".stop-{conv_of(channel)}").unlink(missing_ok=True)
+    project_name, cwd = workspace(channel, cwd)
     p = subprocess.Popen([*pf.cli_cmd(), "chat-talk", channel, msg_id],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=cwd or str(Path.home()), **pf.group_kwargs())
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=cwd,
+                         env={**os.environ, "AGENTBUS_PROJECT": project_name, "PYTHONIOENCODING": "utf-8"}, **pf.group_kwargs())
     set_meta(channel, talk_pid=p.pid, talk_t=time.time())
     names = {k: v.get("name", k) for k, v in agents_dict(load_config()).items()}
     append(channel, "agentbus", f"💬 群聊开始：{'、'.join(names.get(m, m) for m in talk_members(channel))} 按顺序接着聊（最多 {meta(channel)['rounds']} 轮、{lim()['talk_max']} 条，随时可以点停止）。", system=True)
@@ -393,16 +448,23 @@ def _similar(a, b):
     return difflib.SequenceMatcher(None, a[:600], b[:600]).ratio()
 
 
+def attachment_refs(files):
+    return json.dumps([{"path": f["path"], "name": str(f.get("name") or "")[:160]}
+                       for f in (files or [])[-10:] if isinstance(f, dict) and isinstance(f.get("path"), str)], ensure_ascii=False)
+
+
 def run_talk(channel, msg_id):
     """群聊主循环（单独的进程跑）：一轮里成员挨个发言；跳过 / 重复的不发；一整轮没人说话就结束。"""
-    import subprocess
+    import mcp_server
     import pf
-    cfg = load_config()
+    project_name, cwd = workspace(channel, os.getcwd())
+    cfg = load_config(project_name)
     agents = agents_dict(cfg)
     names = {k: v.get("name", k) for k, v in agents.items()}
     L = lim()
     members, rounds, said = talk_members(channel), max(1, min(TALK_ROUNDS, int(meta(channel).get("rounds") or L["talk_rounds"]))), 0
-    topic = next((m["text"] for m in read(channel, 200) if m["id"] == msg_id), "")
+    opening = next((m for m in read(channel, 200) if m["id"] == msg_id and m["frm"] == "user"), {})
+    topic = opening.get("text", "")
     for r in range(rounds):
         spoke = 0
         for aid in members:
@@ -416,20 +478,39 @@ def run_talk(channel, msg_id):
                       f"不超过 {L['talk_chars'] // 2} 字，不要客套，不要重复别人说过的。只发言，**不要动手改文件、不要跑命令**。"
                       "如果你没有新东西可说，就只回复「（跳过）」。")
             try:
-                # 和群聊进程同一组：主人喊停时整组一起停；超时则先 SIGTERM，让 ask 自己停掉执行器再收尾
-                p = subprocess.Popen([*pf.cli_cmd(), "ask", aid, prompt, "--new", "--tag", "头脑风暴"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     stdin=subprocess.DEVNULL, text=True, env={**os.environ, "AGENTBUS_CONV": conv_of(channel), "AGENTBUS_SELF": "user"})
-                try:
-                    reply = (p.communicate(timeout=600)[0] or "").strip()
-                except subprocess.TimeoutExpired:
-                    p.terminate()
-                    try:
-                        p.communicate(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        p.kill()
-                        p.wait()
-                    reply = ""
-            except OSError:
+                # Include material added to this live discussion, not previous topics or private @ assignments.
+                files = list(opening.get("files") or [])
+                for m in read(channel, 200):
+                    if (m.get("files") and m["frm"] == "user" and opening and m["t"] > opening["t"]
+                            and not mentions(m["text"], cfg)):
+                        files.extend(m["files"])
+                jid = mcp_server.start_job({"agent": aid, "task": prompt, "new": True, "tag": "头脑风暴", "project": project_name},
+                                          cwd=cwd, env_extra={"AGENTBUS_CONV": conv_of(channel), "AGENTBUS_SELF": "user", "AGENTBUS_CHAT": channel,
+                                                              "AGENTBUS_TALK": "1", "AGENTBUS_CHAT_FILES": attachment_refs(files)})
+                append(channel, "agentbus", f"💬 {names[aid]} 正在准备第 {r + 1} 轮发言", system=True, job=jid, agent=aid, round=r + 1)
+                deadline = time.monotonic() + 600
+                while not stopped(channel):
+                    snapshot = mcp_server.job_snapshot(jid)
+                    if snapshot["status"] in mcp_server.TERMINAL_JOBS:
+                        break
+                    if time.monotonic() >= deadline:
+                        record = next((rec for rec in running(channel) if rec.get("job") == jid), None)
+                        if record:
+                            pf.kill_job(record)
+                        else:
+                            pf.kill_job(load_json(mcp_server.JOBS / f"{jid}.json", {}))
+                        mcp_server.finish_job(jid, "stalled", "群聊发言超过 10 分钟，已停止。")
+                        snapshot = mcp_server.job_snapshot(jid)
+                        break
+                    time.sleep(.5)
+                if stopped(channel):
+                    break
+                reply = (snapshot.get("reply") or "").strip()
+                if snapshot["status"] != "ok":
+                    append(channel, "agentbus", f"❌ {names[aid]} 发言{snapshot['label']}：{reply or '没有返回内容，请查看任务记录。'}", system=True)
+                    continue
+            except (OSError, ValueError) as error:
+                append(channel, "agentbus", f"❌ {names[aid]} 发言启动失败：{error}", system=True)
                 reply = ""
             if stopped(channel):
                 break

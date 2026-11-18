@@ -65,6 +65,43 @@ def unlock(f):
 
 
 # ---------- 进程 ----------
+def pid_alive(pid):
+    """检查进程是否仍在运行；Windows 的 os.kill(pid, 0) 也可能命中已退出但句柄未关闭的进程。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    if IS_WIN:
+        import ctypes
+        from ctypes import wintypes
+
+        if pid > 0xFFFFFFFF:
+            return False
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE：只检查退出状态
+        if not handle:
+            return ctypes.get_last_error() == 5  # 拒绝访问时不能断定进程已退出
+        try:
+            return kernel.WaitForSingleObject(handle, 0) == 0x00000102  # WAIT_TIMEOUT
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def group_kwargs(hidden=True):
     """让子进程自成一组（看门狗要能整组杀掉），Windows 上顺便不弹黑框。"""
     if IS_WIN:
@@ -94,9 +131,9 @@ def kill_job(rec):
     f = rec.get("_file")
     if f:  # 先标“已取消”：外层刚起执行器、还没登记 worker 的那一瞬间，登记完一看到这个标记就自己停
         try:
-            d = json.load(open(f))
+            d = json.load(open(f, encoding="utf-8"))
             d["cancel"] = True
-            json.dump(d, open(f, "w"), ensure_ascii=False)
+            json.dump(d, open(f, "w", encoding="utf-8"), ensure_ascii=False)
         except (OSError, ValueError):
             pass
     pids = [int(x) for x in (rec.get("pid"), rec.get("worker")) if x]

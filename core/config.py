@@ -74,7 +74,21 @@ def save_json(p, data):
     import threading
     tmp = p.with_suffix(f"{p.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")  # 几个进程 / 线程同时写同一个文件不会互相踩
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-    os.replace(tmp, p)
+    try:
+        for attempt in range(7):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError as error:
+                # Windows 的短时读取可能未共享删除权限；保留原文件并稍后重试原子替换。
+                if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33) or attempt == 6:
+                    raise
+                time.sleep(.02 * 2 ** attempt)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 _held = {}  # 本线程已经拿着的锁（同一线程里嵌套用不会自己卡死自己）

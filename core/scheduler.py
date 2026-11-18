@@ -53,7 +53,7 @@ def _try(name, n, who):
             f.truncate()
             f.write(json.dumps(who, ensure_ascii=False))
             f.flush()
-        (LOCKS / f"{name}.{i}.who").write_text(json.dumps(who, ensure_ascii=False))
+        (LOCKS / f"{name}.{i}.who").write_text(json.dumps(who, ensure_ascii=False), "utf-8")
         return f
     return None
 
@@ -63,7 +63,7 @@ def holders(name, n):
     for i in range(n):
         p = LOCKS / f"{name}.{i}.who"
         try:
-            out.append(json.loads(p.read_text() or "{}"))
+            out.append(json.loads(p.read_text("utf-8") or "{}"))
         except Exception:
             pass
     return [h for h in out if h]
@@ -141,8 +141,4 @@ def status():
 
 
 def _alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+    return pf.pid_alive(pid)

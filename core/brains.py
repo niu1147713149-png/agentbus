@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 H = os.path.expanduser
-CACHE = Path(H("~/.agentbus/brains.json"))
+CACHE = Path(os.environ.get("AGENTBUS_HOME", H("~/.agentbus"))) / "brains.json"
 ORDER = ["disabled", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
 EFFORT_NAME = {"minimal": "极简", "none": "关", "disabled": "关", "low": "低", "medium": "中", "high": "高", "xhigh": "超高", "max": "极限", "ultra": "满血"}
 
@@ -31,7 +31,7 @@ def _codex():
     models, current = [], {}
     for f in ("~/.codex/models_cache.json", "~/.codex/opencodex-catalog.json"):
         try:
-            for m in json.loads(Path(H(f)).read_text()).get("models") or []:
+            for m in json.loads(Path(H(f)).read_text("utf-8")).get("models") or []:
                 mid = m.get("slug") or m.get("id")
                 if mid and m.get("visibility") != "hide":
                     models.append({"id": mid, "name": m.get("display_name") or mid, "default": m.get("default_reasoning_level"),
@@ -41,7 +41,7 @@ def _codex():
         except Exception:
             pass
     try:
-        t = Path(H("~/.codex/config.toml")).read_text()
+        t = Path(H("~/.codex/config.toml")).read_text("utf-8")
         m = re.search(r'^model\s*=\s*"([^"]+)"', t, re.M)
         e = re.search(r'^model_reasoning_effort\s*=\s*"([^"]+)"', t, re.M)
         current = {"model": m.group(1) if m else None, "effort": e.group(1) if e else None}
@@ -52,27 +52,31 @@ def _codex():
 
 def _help(cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout
+        cmd = [_which(cmd[0]) or cmd[0], *cmd[1:]]
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=15).stdout
     except Exception:
         return ""
 
 
-def _claude():
-    h = _help(["claude", "--help"])
+def _claude(binary=None):
+    h = _help([binary or "claude", "--help"])
     em = re.search(r"--effort[^\n]*\n?[^(]*\(([^)]+)\)", h)
-    efforts = [x.strip() for x in em.group(1).split(",")] if em else ["low", "medium", "high"]
+    efforts = _sort(re.findall(r"\b(?:low|medium|high|xhigh|max)\b", em.group(1))) if em else []
+    efforts = efforts or ["low", "medium", "high"]
     mm = re.search(r"--model <model>(.*?)\n  --", h, re.S)
     aliases = re.findall(r"'([a-z][a-z0-9-]*)'", mm.group(1)) if mm else []
     aliases = list(dict.fromkeys(aliases + ["haiku"])) if aliases else ["opus", "sonnet", "haiku"]
-    cur = None
+    cur, effort = None, None
     try:
-        cur = json.loads(Path(H("~/.claude/settings.json")).read_text()).get("model")
+        settings = json.loads(Path(H("~/.claude/settings.json")).read_text("utf-8"))
+        cur, effort = settings.get("model"), settings.get("effortLevel")
     except Exception:
         pass
     models = [{"id": a, "name": a.capitalize(), "efforts": efforts} for a in aliases]
     if cur and cur not in aliases:
         models.insert(0, {"id": cur, "name": cur, "efforts": efforts})
-    return {"models": models, "current": {"model": cur, "effort": None}, "switch": True}
+    return {"models": models, "current": {"model": cur, "effort": effort}, "switch": True}
 
 
 def _opencode_default():
@@ -268,25 +272,27 @@ def _which(cmd):
 READERS = {"codex": _codex, "claude": _claude, "opencode": _opencode, "zcode": _zcode}
 SLOW = {"opencode", "claude", "zcode"}  # 要跑命令的：后台识别，先用存盘的结果
 TTL = 6 * 3600
+CAPABILITIES_VERSION = 2
 _mem, _busy = {}, set()
 
 
 def _load_disk():
     try:
-        return json.loads(CACHE.read_text())
+        return json.loads(CACHE.read_text("utf-8"))
     except Exception:
         return {}
 
 
-def _detect(kind):
+def _detect(kind, binary=None):
     try:
-        r = READERS[kind]()
+        r = _claude(binary) if kind == "claude" else READERS[kind]()
         r["t"] = time.time()
+        r["version"] = CAPABILITIES_VERSION
+        r["source_bin"] = binary
         _mem[kind] = r
-        disk = _load_disk()
-        disk[kind] = r
         CACHE.parent.mkdir(parents=True, exist_ok=True)
-        CACHE.write_text(json.dumps(disk, ensure_ascii=False))
+        from config import update_json
+        update_json(CACHE, lambda data: data.__setitem__(kind, r))
     finally:
         _busy.discard(kind)
 
@@ -301,22 +307,72 @@ def options(agent, fresh=False):
     if kind not in READERS:
         return {"models": [], "current": {}, "switch": False, "note": "这个 agent 暂不支持在 agentbus 里换模型"}
     hit = _mem.get(kind) or _load_disk().get(kind)
-    stale = fresh or not hit or time.time() - hit.get("t", 0) > TTL
+    binary = agent.get("bin") if kind == "claude" else None
+    stale = (fresh or not hit or time.time() - hit.get("t", 0) > TTL
+             or hit.get("version") != CAPABILITIES_VERSION or hit.get("source_bin") != binary)
     if stale and kind not in _busy:
         _busy.add(kind)
         if kind in SLOW and hit:
-            threading.Thread(target=_detect, args=(kind,), daemon=True).start()
+            threading.Thread(target=_detect, args=(kind, binary), daemon=True).start()
         else:
-            _detect(kind)
+            _detect(kind, binary)
     hit = _mem.get(kind) or _load_disk().get(kind) or {"models": [], "current": {}, "switch": True}
     if kind not in _mem:
         _mem[kind] = hit
-    return dict(hit, detecting=kind in _busy)
+    result = dict(hit, detecting=kind in _busy)
+    if kind in ("claude", "codex"):
+        # 未列入本机目录的完整 ID 仍可使用；档位来自 CLI/目录及当前有效配置。
+        levels = [e for m in hit.get("models", []) for e in m.get("efforts", [])]
+        current_effort = (hit.get("current") or {}).get("effort")
+        if current_effort:
+            levels.append(current_effort)
+        result.update(custom_model=True, custom_efforts=_sort(levels) or ["low", "medium", "high"])
+    return result
 
 
 def chosen(cfg, agent_id):
     """主人在 agentbus 里给这个队员选的大脑（没选就是空，用它自己的默认）。"""
     return (cfg.get("brains") or {}).get(agent_id) or {}
+
+
+def model_info(opts, model):
+    known = next((m for m in opts.get("models", []) if m["id"] == model), None)
+    if known is not None:
+        return known
+    return {"id": model, "name": model, "custom": True, "efforts": opts.get("custom_efforts", [])}
+
+
+def validate_choice(data, opts):
+    """完整模型 ID 原样传给 CLI；拒绝无效档位和可能被命令包装器解释的字符。"""
+    choice = {}
+    for key in ("model", "effort"):
+        value = data.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError("模型 ID 和思考程度必须是文本")
+        if value.strip():
+            choice[key] = value.strip()
+    if choice and not opts.get("switch"):
+        raise ValueError("这个队员暂不支持切换模型")
+    model = choice.get("model")
+    if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,511}", model):
+        raise ValueError("模型 ID 只能包含字母、数字及 . _ : / @ + - [ ]，最多 512 个字符")
+    effort = choice.get("effort")
+    if effort:
+        model = model or (opts.get("current") or {}).get("model")
+        levels = model_info(opts, model).get("efforts") or []
+        if effort not in levels:
+            raise ValueError("该模型的可选思考程度：" + ("、".join(levels) or "默认"))
+    return choice
+
+
+def for_run(brain, opts):
+    """显式换模型但选自动档位时，不带入旧模型不兼容的本机强度。"""
+    result = dict(brain)
+    if result.get("model") and not result.get("effort"):
+        _, effort, _ = effective(brain, opts)
+        if effort:
+            result["effort"] = effort
+    return result
 
 
 def flags(kind, brain):
@@ -338,8 +394,11 @@ def effective(brain, opts):
     """实际会用的模型和强度：主人选的 > 它自己的当前设置 > 模型默认强度。"""
     cur = opts.get("current") or {}
     m = brain.get("model") or cur.get("model") or ""
-    info = next((x for x in opts.get("models") or [] if x["id"] == m), {})
-    e = brain.get("effort") or cur.get("effort") or info.get("default")
+    info = model_info(opts, m)
+    inherited = cur.get("effort")
+    if brain.get("model") and not info.get("custom") and inherited not in info.get("efforts", []):
+        inherited = None
+    e = brain.get("effort") or inherited or info.get("default")
     return m, e, info
 
 

@@ -67,6 +67,8 @@
   function onState(s) {
     if (ui.lock && Date.now() < ui.lock.until) { const x = s.agents.find(a => a.id === ui.lock.id); if (x) x.jobs = { ...ui.lock.jobs }; }
     const first = !S, projChanged = S && S.project !== s.project;
+    const channel = ui.chat.channel;
+    const endedHere = S?.running.some(r => r.channel === channel && r.job && !s.running.some(n => n.job === r.job));
     S = s;
     applyTheme(s.settings.theme);
     I18N.sync(s.settings.lang); // 语言和服务端存的不一样就重新加载
@@ -79,8 +81,13 @@
     $("#proj").title = "进主位的办公室";
     const qn = $(`.nav[data-page="quests"]`), b = qn.querySelector(".badge");
     if (s.running.length) (b || qn.appendChild(Object.assign(document.createElement("span"), { className: "badge" }))).textContent = s.running.length; else b && b.remove();
+    // 回复可能先入频道，运行记录稍后才结束。退出时再取一次最终状态，不把消失当作成功。
+    if (s.chat_rev !== ui.chatRev || endedHere) {
+      ui.chatRev = s.chat_rev;
+      if (route.page === "chat" || route.page === "base") loadChat();
+      else ui.chat.data = null;
+    }
     if (first || projChanged) go(); else if (!dragging) paint();
-    if ((route.page === "chat" || route.page === "base") && s.chat_rev !== ui.chatRev) { ui.chatRev = s.chat_rev; loadChat(); }
   }
 
   // ---------- 路由 ----------
@@ -757,14 +764,15 @@
     const ch = o.chosen || {}, cur = o.current || {};
     const model = ch.model || cur.model;
     const m = (o.models || []).find(x => x.id === model);
-    const effs = (m && m.efforts) || [];
-    const eff = ch.effort || cur.effort || (m && m.default) || effs[Math.floor((effs.length - 1) / 2)];
+    const effs = m ? (m.efforts || []) : (o.custom_efforts || []);
+    const inherited = ch.model && m && !effs.includes(cur.effort) ? null : cur.effort;
+    const eff = ch.effort || inherited || (m && m.default);
     return { ch, cur, model, m, effs, eff };
   }
   // 角色卡上的大脑按钮：像 GPT 那样一颗小胶囊「GPT-6.1-Sol 中 ⌄」
   function brainBtn(a) {
     const b = a.brain; if (!b) return "";
-    return `<button class="brain-btn ${b.set ? "set" : ""}" data-bmenu="${esc(a.id)}" ${b.switch ? "" : "disabled"}><b>${esc(b.name || "默认")}</b>${b.effort_name ? `<em>${esc(b.effort_name)}</em>` : ""}${b.switch ? icon("down") : ""}</button>`;
+    return `<button class="brain-btn ${b.set ? "set" : ""}" data-bmenu="${esc(a.id)}" title="${esc(a.name)} · ${esc(b.model || "默认模型")} · 模型与思考程度" aria-label="${esc(a.name)}：模型与思考程度" ${b.switch ? "" : "disabled"}><b>${esc(b.name || "默认")}</b>${b.effort_name ? `<em>${esc(b.effort_name)}</em>` : ""}${b.switch ? icon("down") : ""}</button>`;
   }
   function cloneBar(a) {
     if (a.clone_of) return `<a class="clone-chip" href="#hero/${encodeURIComponent(a.clone_of)}" title="回到本体">${avatar(A(a.clone_of), 20)}本体</a><button class="clone-chip x" data-clone-x="${esc(a.id)}">解散</button>`;
@@ -775,7 +783,8 @@
   // 弹层：上面是强度 + 模型（点开换模型），下面是胶囊拖动条
   async function brainMenu(anchor, a, view) {
     closePop();
-    const o = await brainOf(a.id);
+    const o = await brainOf(a.id, true);
+    if (o.custom_model) return brainEditor(anchor, a, o);
     const pop = document.createElement("div"); pop.className = "pop bp"; pop.id = "pop"; pop.dataset.agent = "brain:" + a.id;
     document.body.appendChild(pop);
     const nm = e => (o.names || {})[e] || e || "";
@@ -810,19 +819,91 @@
       if (fr) { fr.textContent = "识别中…"; await api("/api/brain?fresh=1&agent=" + encodeURIComponent(a.id)); setTimeout(async () => { Object.assign(o, await brainOf(a.id, true)); if ($("#pop") === pop) draw("models"); }, 1500); }
     });
   }
+  function brainEditor(anchor, a, o) {
+    const pop = document.createElement("div");
+    pop.id = "pop"; pop.className = "pop bp brain-editor"; pop.dataset.agent = "brain:" + a.id;
+    pop.setAttribute("role", "dialog"); pop.setAttribute("aria-label", a.name + " 模型设置");
+    const current = effOf(o), names = o.names || {};
+    pop.innerHTML = `<div class="bp-nav"><b>${esc(a.name)} · 模型设置</b><button type="button" data-bclose aria-label="关闭模型设置">${icon("close")}</button></div>
+      <p class="brain-current">当前：<strong>${esc(current.model || "CLI 默认")}</strong>${current.eff ? ` · ${esc(current.eff)}` : ""}</p>
+      <form class="brain-form">
+        <label for="brain-model">模型 ID</label>
+        <input id="brain-model" name="model" list="brain-model-list" value="${esc(current.ch.model || "")}" placeholder="${esc(current.cur.model || "输入完整模型 ID，或留空跟随 CLI")}" autocomplete="off" spellcheck="false" maxlength="512">
+        <datalist id="brain-model-list"></datalist>
+        <div class="brain-model-help"><span>可选择已识别模型，也可直接输入完整 ID。</span><button type="button" data-brefresh>刷新列表</button></div>
+        <label for="brain-effort">思考程度</label><select id="brain-effort" name="effort"></select>
+        <p class="small muted" data-bnote></p>
+        <p class="small muted">保存后从下一次派单生效。留空模型 ID 跟随本机 CLI；恢复默认会清除两项覆盖。</p>
+        <div class="brain-actions"><button class="btn ghost sm" type="button" data-breset>恢复默认</button><button class="btn primary sm" type="submit">保存配置</button></div>
+      </form>`;
+    document.body.appendChild(pop);
+    const form = $("form", pop), modelInput = form.elements.model, effortInput = form.elements.effort;
+    const position = () => {
+      const r = anchor.getBoundingClientRect();
+      pop.style.left = Math.max(12, Math.min(r.left, innerWidth - pop.offsetWidth - 12)) + "px";
+      pop.style.top = Math.max(12, Math.min(r.bottom + 6, innerHeight - pop.offsetHeight - 12)) + "px";
+    };
+    const fillModels = () => {
+      const ids = [...new Set([...(o.models || []).map(m => m.id), current.ch.model, (o.current || {}).model].filter(Boolean))];
+      $("datalist", pop).innerHTML = ids.map(id => `<option value="${esc(id)}"></option>`).join("");
+    };
+    const fillEfforts = desired => {
+      const draft = { ...o, chosen: { model: modelInput.value.trim() } }, e = effOf(draft);
+      effortInput.innerHTML = `<option value="">自动${e.eff ? `（${esc(e.eff)} · ${esc(names[e.eff] || e.eff)}）` : "（CLI 默认）"}</option>` +
+        e.effs.map(value => `<option value="${esc(value)}">${esc(value)} · ${esc(names[value] || value)}</option>`).join("");
+      effortInput.value = e.effs.includes(desired) ? desired : "";
+      $("[data-bnote]", pop).textContent = !e.m && e.model
+        ? "此 ID 未列入本机模型列表，是否可用及支持哪些档位取决于当前账号和模型服务。"
+        : "自动优先沿用兼容的本机档位，否则采用模型推荐档位。";
+      position();
+    };
+    fillModels(); fillEfforts(current.ch.effort || "");
+    modelInput.oninput = () => fillEfforts(effortInput.value);
+    $("[data-bclose]", pop).onclick = closePop;
+    const save = async patch => {
+      const buttons = $$('button', pop); buttons.forEach(b => b.disabled = true);
+      try {
+        if (await setBrain(a, patch)) { closePop(); toast("已保存，下次派单生效"); }
+      } finally { buttons.forEach(b => b.disabled = false); }
+    };
+    form.onsubmit = e => { e.preventDefault(); save({ model: modelInput.value.trim(), effort: effortInput.value }); };
+    $("[data-breset]", pop).onclick = () => save({ model: "", effort: "" });
+    $("[data-brefresh]", pop).onclick = async e => {
+      const button = e.currentTarget; button.disabled = true; button.textContent = "识别中…";
+      try {
+        const result = await api("/api/brain?fresh=1&agent=" + encodeURIComponent(a.id));
+        if (!result) return;
+        Object.assign(o, result);
+        if (result.detecting) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          Object.assign(o, await brainOf(a.id, true));
+        }
+        if ($("#pop") === pop) { fillModels(); fillEfforts(effortInput.value); }
+      } catch { toast("模型列表刷新失败", "close"); }
+      finally { button.disabled = false; button.textContent = "刷新列表"; }
+    };
+    modelInput.focus();
+  }
   async function setBrain(a, patch) {
     const o = await brainOf(a.id);
     const b = { ...(o.chosen || {}), ...patch };
-    if (patch.model !== undefined) { // 换模型：新模型不支持原来的强度就去掉
+    if (patch.model !== undefined && patch.effort === undefined) { // 旧菜单换模型时清除不兼容的显式档位
       const m = (o.models || []).find(x => x.id === (b.model || (o.current || {}).model));
       if (b.effort && m && !m.efforts.includes(b.effort)) delete b.effort;
     }
     Object.keys(b).forEach(k => { if (!b[k]) delete b[k]; });
-    o.chosen = b;
+    let saved;
+    try { saved = await api("/api/brain", { agent: a.id, ...b }); }
+    catch { toast("保存失败，请检查本地服务", "close"); return false; }
+    if (!saved) return false;
+    o.chosen = saved.chosen || b;
     const e = effOf(o);
-    a.brain = { ...(a.brain || {}), set: !!(b.model || b.effort), name: (e.m && e.m.name) || short(e.model) || "默认", effort_name: (o.names || {})[e.eff] || e.eff || "" };
+    a.brain = { ...(a.brain || {}), set: !!(b.model || b.effort), model: e.model, effort: e.eff,
+      label: [(e.m && e.m.name) || e.model || "默认", (o.names || {})[e.eff] || e.eff].filter(Boolean).join(" "),
+      name: (e.m && e.m.name) || e.model || "默认", effort_name: (o.names || {})[e.eff] || e.eff || "" };
     painted.hero = null; if (route.page === "hero") pHero();
-    await api("/api/brain", { agent: a.id, ...b });
+    if (route.page === "chat") paintChat();
+    return true;
   }
   // 拖动条：按住拖，松手吸附到最近一档
   let capDrag = null;
@@ -1118,24 +1199,42 @@
   // 群聊模式（头脑风暴）：主人一句话，成员按顺序挨个读群里的内容接着聊，有轮数、条数、字数、重复、跳过的限制，随时能停。
   // 上下文 = 压缩要点 + 最近的消息（8000 字以内），太长了后台自动压缩。附件：选文件 / 粘贴图片 / 拖进来，给队员的是本地完整路径。
   // 设计借鉴 agentchattr（MIT）；叫醒 agent 走 agentbus 自己的派活，不需要主位。基地右侧的小聊天框用的是同一套。
-  ui.chat = { channel: (() => { try { return localStorage.getItem("chatChannel") || "大厅"; } catch { return "大厅"; } })(), data: null, files: [] };
+  ui.chat = { channel: (() => { try { return localStorage.getItem("chatChannel") || "大厅"; } catch { return "大厅"; } })(), data: null };
+  const drafts = new Map();
+  function chatDraft(channel = ui.chat.channel) {
+    if (!drafts.has(channel)) drafts.set(channel, { text: "", entries: [], sending: false });
+    return drafts.get(channel);
+  }
   const mentionable = () => S.agents.filter(a => a.installed && a.billing !== "manual" && !a.sealed); // 封印的 Claude 不进聊天室
   const chatName = id => id === "user" ? "我" : id === "agentbus" ? "agentbus" : A(id).name;
   const chatText = t => esc(t).replace(/@(所有人|[\w一-龥·.-]+)/g, '<b class="at">@$1</b>').replace(/\n/g, "<br>");
-  const fileHTML = f => f.image && f.path.includes("/.agentbus/chat/files/")
+  const fileHTML = f => f.image && (f.uploaded || f.path.replace(/\\/g, "/").includes("/.agentbus/chat/files/"))
     ? `<a class="cf img" href="/api/chat/file?p=${encodeURIComponent(f.path)}" target="_blank" title="${esc(f.path)}"><img src="/api/chat/file?p=${encodeURIComponent(f.path)}" alt=""></a>`
-    : `<span class="cf" title="${esc(f.path)}">📎 ${esc(f.name || f.path.split("/").pop())}<em>${esc(f.path)}</em></span>`;
-  const msgHTML = (m, mini) => m.system ? `<div class="cm sys">${chatText(m.text)}</div>`
+    : `<span class="cf" title="${esc(f.path)}">📎 ${esc(f.name || f.path.split(/[\\/]/).pop())}<em>${esc(f.path)}</em></span>`;
+  const jobText = (m, mini) => { const j = m.task_state; if (!j) return m.text;
+    if (!mini && ["starting", "queued", "running"].includes(j.status)) return m.text;
+    const mark = { ok: "✅", failed: "❌", error: "❌", stopped: "⏹", stalled: "⏹", interrupted: "⚠️", queued: "⏳", running: "▶" }[j.status] || "⏳";
+    return `${mark} ${chatName(m.agent)}${m.round ? " · 第 " + m.round + " 轮" : ""} · ${j.label}${j.reason ? " · " + j.reason : j.progress ? " · " + j.progress.detail : ""}`;
+  };
+  const msgHTML = (m, mini) => m.system ? `<div class="cm sys">${chatText(jobText(m, mini))}</div>`
     : `<div class="cm ${m.frm === "user" ? "me" : ""} ${m.talk ? "talk" : ""}">${m.frm === "user" ? "" : avatar(A(m.frm), mini ? 24 : 32)}<div class="cb"><div class="cn">${esc(chatName(m.frm))}${m.talk ? `<em>群聊</em>` : ""}<span>${new Date(m.t * 1000).toTimeString().slice(0, 5)}</span></div>
         <div class="ct" data-notr>${chatText(mini ? m.text.slice(0, 300) + (m.text.length > 300 ? "…" : "") : m.text)}${(m.files || []).length ? `<div class="cfs">${m.files.map(fileHTML).join("")}</div>` : ""}</div></div></div>`;
-  async function loadChat() {
-    const r = await fetch(`/api/chat?channel=${encodeURIComponent(ui.chat.channel)}`).then(x => x.json()).catch(() => null);
-    if (!r) return;
+  let pendingChat = null;
+  async function loadChat(force = true) {
+    const channel = ui.chat.channel;
+    if (!force && pendingChat?.channel === channel) return;
+    const request = pendingChat = { channel };
+    const r = await fetch(`/api/chat?channel=${encodeURIComponent(channel)}`).then(x => x.ok ? x.json() : null).catch(() => null);
+    if (request !== pendingChat) return;
+    pendingChat = null;
+    if (!r) { ui.chatRev = null; return; } // 下一次状态推送时重试
+    if (r.channel !== ui.chat.channel) return;
     ui.chat.data = r;
     if (route.page === "chat") paintChat();
     if (route.page === "base") paintMiniChat();
   }
   function pChat() {
+    const mounting = !painted.__shell;
     shell(`<div class="head"><div><h1>聊天室</h1><p>@ 队员就是派活，做完的回复发回群里；切到“群聊”，说一句话队员会轮流接着聊。不需要主位。</p></div></div>
       <div class="chat"><aside class="ch-l" id="ch-l"></aside><section class="ch-m"><div class="ch-bar" id="ch-bar"></div><div class="ch-msgs" id="ch-msgs"></div>
         <div class="ch-run" id="ch-run"></div>
@@ -1144,57 +1243,103 @@
               <div class="ch-tools"><label class="ib ch-clip" title="加附件（也可以粘贴图片、把文件拖进来）">📎<input type="file" multiple id="ch-file" hidden></label><span class="small muted">Enter 发送 · Shift+Enter 换行 · 能粘贴图片、拖文件</span></div></div>
             <button class="btn primary" id="ch-send">${icon("chev")}发送</button></div>
           <div class="ch-pop" id="ch-pop" hidden></div></div></section></div>`);
-    if (!ui.chat.data || ui.chat.data.channel !== ui.chat.channel) loadChat(); else paintChat();
+    if (mounting) { $("#ch-text").value = chatDraft().text; paintAtt(); }
+    if (!ui.chat.data || ui.chat.data.channel !== ui.chat.channel) loadChat(false); else paintChat();
   }
   function paintChat() {
-    const d = ui.chat.data; if (!d || !$("#ch-l")) return;
+    const d = ui.chat.data; if (!d || d.channel !== ui.chat.channel || !$("#ch-l")) return;
+    const run = Array.isArray(S.running) ? S.running.filter(r => r.channel === d.channel ||
+      (!r.channel && r.job && d.running_tasks?.some(t => t.job === r.job))) : (d.running_tasks || []);
     part("chl", $("#ch-l"), `<div class="ch-lh">频道<button class="ib" data-ch-new title="新建频道">${icon("plus")}</button></div>` +
       d.channels.map(c => `<button class="ch-c ${c.name === ui.chat.channel ? "on" : ""}" data-ch="${esc(c.name)}"># ${esc(c.name)}</button>`).join(""));
     const mt = d.meta || {}, u = d.usage || {}, talk = mt.mode === "talk";
     const pct = Math.min(100, Math.round((u.chars || 0) / (u.compress_at || 16000) * 100));
     const dutyTxt = !d.duty_now ? "没人回（只记录）" : `${A(d.duty_now).name}${!mt.duty || mt.duty === "auto" ? "（自动）" : ""}`;
     const rule = talk ? `你说一句，${esc((d.talk_members || []).map(x => A(x).name).join("、") || "成员")} 按顺序轮流接着聊，最多 ${mt.rounds || 2} 轮；只聊不动手，要人干活就 @ 他`
+      : mt.handoff_mode === "single" ? "Claude 管需求与产品验收 → Codex 出方案与技术审核 → WorkBuddy 执行和修复；两方审核后汇总修改意见，再交执行"
       : `@ 谁谁干活，干完把结果发回群里；没 @ 人时交给 ${esc(dutyTxt)}`;
     part("chbar", $("#ch-bar"), `<div class="chb-top"><b># ${esc(d.channel)}</b>
         <button class="chb-mode ${talk ? "talk" : ""}" data-chset title="频道设置">${talk ? "💬 群聊" : "🛠 派活"}<span>切换 ${icon("down")}</span></button>
         <span class="ch-ctx" title="给队员的上下文：压缩要点 + 最近消息（${u.budget} 字以内）；没压缩的部分到 ${u.compress_at} 字会自动压缩">上下文<i><b style="width:${pct}%"></b></i>${Math.round((u.chars || 0) / 100) / 10}k${u.compressions ? ` · 压过 ${u.compressions} 次` : ""}</span>
         <button class="btn sm ghost" data-chcompress title="把旧消息压成要点">压缩</button>
-        ${d.running || d.talking ? `<button class="btn sm danger" data-chstop>⏹ 停止</button>` : ""}
+        ${run.length || d.talking ? `<button class="btn sm danger" data-chstop>⏹ 停止</button>` : ""}
         <button class="ib" data-chset title="频道设置">${icon("settings")}</button></div>
-      <div class="chb-rule">${rule}</div>`);
+      <div class="chb-rule">${rule}${d.cwd ? `<br>共同工作目录：${esc(d.cwd)}` : ""}</div>
+      <div class="ch-brains">${S.agents.filter(a => a.installed && a.brain?.custom_model && (mt.members || []).includes(a.id)).map(a => `<div><span>${esc(a.name)}</span>${brainBtn(a)}</div>`).join("")}</div>`);
     const ta = $("#ch-text"); if (ta) ta.placeholder = talk ? "说一句话，大家轮流接着聊…（@ 某人 = 单独给他派活）" : "@ 队员派活，比如：@GPT 帮我找三张参考图…（不 @ 就交给值班的）";
-    const box = $("#ch-msgs"), near = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    if (part("chm", box, d.messages.length ? d.messages.map(m => msgHTML(m)).join("")
-      : `<div class="empty"><div class="big">💬</div>还没有消息<br><span class="small">试试：@GPT 帮我找三张参考图；或者切到“群聊”问一句大家怎么看</span></div>`) && near) box.scrollTop = 1e9;
-    const run = S.running.filter(r => (r.conv || "").startsWith("chat-"));
-    part("chr", $("#ch-run"), (d.talking ? `<span class="pill accent">💬 群聊进行中…</span>` : "") + run.map(r => `<span class="pill hp">${avatar(A(r.agent), 16)}${esc(A(r.agent).name)} 正在处理 <span data-since="${r.start}"></span></span>`).join(""));
+    if (painted.chatMessages !== d.messages) {
+      const box = $("#ch-msgs"), near = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+      if (part("chm", box, d.messages.length ? d.messages.map(m => msgHTML(m)).join("")
+        : `<div class="empty"><div class="big">💬</div>还没有消息<br><span class="small">试试：@GPT 帮我找三张参考图；或者切到“群聊”问一句大家怎么看</span></div>`) && near) box.scrollTop = 1e9;
+      painted.chatMessages = d.messages;
+    }
+    part("chr", $("#ch-run"), (d.talking ? `<span class="pill accent">💬 群聊进行中…</span>` : "") + run.map(r => {
+      const detail = r.queued ? "排队中 · " + r.queued : r.progress?.detail || (r.worker ? "执行中" : "已接单，正在启动");
+      return `<span class="pill ${r.queued ? "gold" : "hp"}">${avatar(A(r.agent), 16)}<b>${esc(A(r.agent).name)}</b><span class="ch-detail" role="status">${esc(detail)}</span>${Number.isFinite(r.start) ? `<time title="本棒已用时间" data-since="${r.start}"></time>` : ""}</span>`;
+    }).join(""));
     part("chq", $("#ch-quick"), mentionable().map(a => `<button class="chip" data-at="${esc(a.name)}">${avatar(a, 20)}@${esc(a.name)}</button>`).join("") + `<button class="chip" data-at="所有人">@所有人</button>`);
     paintAtt();
   }
-  const paintAtt = () => { const el = $("#ch-att") || $("#mc-att"); if (el) el.innerHTML = ui.chat.files.map((f, i) => `<span class="cf">${f.image ? "🖼" : "📎"} ${esc(f.name)}<button data-attx="${i}">×</button></span>`).join(""); };
-  async function upload(file) { // 浏览器里拿不到文件的本地路径：先存进附件目录，再把那里的完整路径发给队员
-    const r = await fetch("/api/chat/upload", { method: "POST", headers: { "X-Name": encodeURIComponent(file.name || "粘贴的图片.png") }, body: file }).then(x => x.json()).catch(() => null);
-    if (r && r.path) { ui.chat.files.push(r); paintAtt(); } else toast((r && r.error) || "附件没传上", "close");
+  const paintAtt = () => {
+    const d = chatDraft(), el = $("#ch-att") || $("#mc-att"), send = $("#ch-send") || $("#mc-send");
+    if (el) el.innerHTML = d.entries.map((a, i) => `<span class="cf">${a.result?.image ? "🖼" : "📎"} ${esc(a.name)}${a.state === "loading" ? ` <small role="status">上传中…</small>` : a.state === "error" ? ` <button data-attretry="${i}" title="${esc(a.error)}">上传失败，重试</button>` : ""}<button data-attx="${i}" title="移除附件"${d.sending ? " disabled" : ""}>×</button></span>`).join("");
+    if (send) send.disabled = d.sending || d.entries.some(a => a.state !== "ready");
+  };
+  async function uploadEntry(a) {
+    a.state = "loading"; paintAtt();
+    try {
+      const resp = await fetch("/api/chat/upload", { method: "POST", headers: { "X-Name": encodeURIComponent(a.name) }, body: a.file });
+      const r = await resp.json();
+      if (!resp.ok || !r.path) throw new Error(r.error || "附件没传上");
+      a.result = r; a.state = "ready"; delete a.file;
+    } catch (e) { a.error = e.message || "附件没传上"; a.state = "error"; }
+    paintAtt();
+  }
+  function upload(file) {
+    const d = chatDraft();
+    if (d.sending) return;
+    if (d.entries.length >= 10) return toast("每条消息最多可附 10 个文件", "close");
+    const a = { file, name: file.name || "粘贴的图片.png" };
+    d.entries.push(a); return uploadEntry(a);
   }
   async function sendChat(fromMini) {
-    const ta = $(fromMini ? "#mc-text" : "#ch-text"), text = ta.value.trim(); if (!text && !ui.chat.files.length) return;
-    ta.value = ""; const pop = $("#ch-pop"); if (pop) pop.hidden = true;
-    const files = ui.chat.files; ui.chat.files = []; paintAtt();
-    const r = await api("/api/chat/send", { channel: ui.chat.channel, text: text || "（附件）", files });
-    if (r && !r.jobs.length && !/@/.test(text) && (ui.chat.data.meta || {}).mode !== "talk" && !(ui.chat.data.meta || {}).duty) toast("发出去了（没 @ 人，也没值班的，所以没人回）", "check");
-    loadChat();
+    const channel = ui.chat.channel, d = chatDraft(), ta = $(fromMini ? "#mc-text" : "#ch-text");
+    if (!ta || d.sending || d.entries.some(a => a.state !== "ready")) return;
+    const original = d.text = ta.value, text = original.trim(), files = d.entries.map(a => a.result);
+    if (!text && !files.length) return;
+    d.sending = true; paintAtt();
+    try {
+      const r = await api("/api/chat/send", { channel, text: text || "（附件）", files });
+      if (!r?.ok) return;
+      d.entries = [];
+      if (d.text === original) d.text = "";
+      if (ui.chat.channel !== channel) return;
+      const field = $("#ch-text") || $("#mc-text"); if (field) field.value = d.text;
+      const pop = $("#ch-pop"); if (pop) pop.hidden = true;
+      if (!r.jobs.length && !/@/.test(text) && ui.chat.data?.meta?.mode !== "talk" && !ui.chat.data?.meta?.duty) toast("发出去了（没 @ 人，也没值班的，所以没人回）", "check");
+      loadChat();
+    } catch { toast("未确认送达，草稿已保留，请先查看频道消息", "close"); }
+    finally { d.sending = false; paintAtt(); }
+  }
+  function switchChannel(name) {
+    ui.chat.channel = name;
+    try { localStorage.setItem("chatChannel", name); } catch {}
+    const field = $("#ch-text"); if (field) field.value = chatDraft().text;
+    paintAtt(); painted.chl = painted.chm = painted.chbar = null; return loadChat();
   }
   function insertAt(name, fromMini) {
     const ta = $(fromMini ? "#mc-text" : "#ch-text"), v = ta.value, i = ta.selectionStart, before = v.slice(0, i).replace(/@[^\s@]*$/, "");
-    ta.value = before + "@" + name + " " + v.slice(i); ta.focus(); const pop = $("#ch-pop"); if (pop) pop.hidden = true;
+    chatDraft().text = ta.value = before + "@" + name + " " + v.slice(i); ta.focus(); const pop = $("#ch-pop"); if (pop) pop.hidden = true;
   }
-  const chatSet = async kw => { await api("/api/chat/settings", { channel: ui.chat.channel, ...kw }); painted.chbar = null; loadChat(); };
+  const chatSet = async kw => { if (!await api("/api/chat/settings", { channel: ui.chat.channel, ...kw })) return false; painted.chbar = null; loadChat(); return true; };
   // 频道设置：这个频道用来派活还是群聊；派活时没 @ 人谁来回；群聊时谁参加、聊几轮
   function chatSettings() {
-    const d = ui.chat.data, mt = d.meta || {}, pool = mentionable().filter(a => a.id !== "claude");
-    const st = { mode: mt.mode || "work", duty: mt.duty || "auto", members: [...(mt.members || [])], rounds: Number(mt.rounds || 2) };
+    const d = ui.chat.data, mt = d.meta || {}, pool = mentionable();
+    const st = { mode: mt.mode || "work", duty: mt.duty || "auto", members: [...(mt.members || [])], rounds: Number(mt.rounds || 2), project: mt.project || "" };
     const draw = () => {
       $("#cs-body").innerHTML = `
+        <div class="cs-row"><div><b>共同工作项目</b><span>本频道的群聊和派单都使用这个项目文件夹</span></div>
+          <select data-csproject><option value="">跟随当前项目</option>${(S.projects || []).map(p => `<option value="${esc(p)}" ${st.project === p ? "selected" : ""}>${esc(p)}</option>`).join("")}</select></div>
         <div class="cs-modes">${[["work", "🛠 派活", "@ 队员就是给他派活：他去干，干完把结果发回群里；他回复里 @ 别人就接力。适合布置任务。"],
           ["talk", "💬 群聊（头脑风暴）", "你说一句，几位队员按顺序读前面的内容轮流发言：补充、反驳、提建议，只聊不动手。适合讨论方案、出点子。"]]
           .map(([k, t, dsc]) => `<button class="cs-mode ${st.mode === k ? "on" : ""}" data-csmode="${k}"><b>${t}</b><span>${dsc}</span></button>`).join("")}</div>
@@ -1215,17 +1360,19 @@
       const m = t.closest("[data-csmode]"); if (m) { st.mode = m.dataset.csmode; return draw(); }
       const mm = t.closest("[data-csmem]"); if (mm) { const id = mm.dataset.csmem; st.members = st.members.includes(id) ? st.members.filter(x => x !== id) : [...st.members, id]; return draw(); }
       const r = t.closest("[data-csround]"); if (r) { st.rounds = Number(r.dataset.csround); return draw(); }
-      if (t.closest("[data-csok]")) { $("#layer").innerHTML = ""; await chatSet(st); toast("频道设置保存了", "check"); }
+      if (t.closest("[data-csok]") && await chatSet(st)) { $("#layer").innerHTML = ""; toast("频道设置保存了", "check"); }
     };
-    $("#sheet-bg").onchange = e => { if (e.target.matches("[data-csduty]")) st.duty = e.target.value; };
+    $("#sheet-bg").onchange = e => { if (e.target.matches("[data-csduty]")) st.duty = e.target.value; if (e.target.matches("[data-csproject]")) st.project = e.target.value; };
   }
   document.addEventListener("click", async e => {
     if (route.page !== "chat" && route.page !== "base") return;
-    const ax = e.target.closest("[data-attx]"); if (ax) { ui.chat.files.splice(Number(ax.dataset.attx), 1); return paintAtt(); }
+    const d = chatDraft(), ax = e.target.closest("[data-attx]"), retry = e.target.closest("[data-attretry]");
+    if (ax && !d.sending) { d.entries.splice(Number(ax.dataset.attx), 1); return paintAtt(); }
+    if (retry) { const a = d.entries[Number(retry.dataset.attretry)]; if (a?.state === "error") return uploadEntry(a); }
     if (e.target.closest("#mc-send")) return sendChat(true);
     const mat = e.target.closest("[data-mcat]"); if (mat) return insertAt(mat.dataset.mcat, true);
     if (route.page !== "chat") return;
-    const c = e.target.closest("[data-ch]"); if (c) { ui.chat.channel = c.dataset.ch; try { localStorage.setItem("chatChannel", ui.chat.channel); } catch {} painted.chl = painted.chm = painted.chbar = null; return loadChat(); }
+    const c = e.target.closest("[data-ch]"); if (c) return switchChannel(c.dataset.ch);
     if (e.target.closest("#ch-send")) return sendChat();
     const at = e.target.closest("[data-at]"); if (at) return insertAt(at.dataset.at);
     if (e.target.closest("[data-chset]")) return chatSettings();
@@ -1237,14 +1384,14 @@
     }
   });
   document.addEventListener("change", e => {
-    if (route.page !== "chat") return;
+    if (route.page !== "chat" && route.page !== "base") return;
     const t = e.target;
-    if (t.id === "ch-file") { [...t.files].forEach(upload); t.value = ""; }
+    if (["ch-file", "mc-file"].includes(t.id)) { [...t.files].forEach(upload); t.value = ""; }
   });
   document.addEventListener("keydown", async e => {
     if (route.page === "chat" && e.target.id === "ch-newname" && e.key === "Enter" && !e.isComposing) {
       const n = e.target.value.trim(); if (!n) return;
-      if (await api("/api/chat/channel", { name: n })) { ui.chat.channel = n; painted.chl = painted.chm = painted.chbar = null; loadChat(); }
+      if (await api("/api/chat/channel", { name: n })) return switchChannel(n);
       return;
     }
     if (!["ch-text", "mc-text"].includes(e.target.id)) return;
@@ -1252,6 +1399,7 @@
     if (e.key === "Escape") { const pop = $("#ch-pop"); if (pop) pop.hidden = true; }
   });
   document.addEventListener("input", e => { // 打 @ 时弹出队员列表
+    if (["ch-text", "mc-text"].includes(e.target.id)) chatDraft().text = e.target.value;
     if (e.target.id !== "ch-text") return;
     const m = e.target.value.slice(0, e.target.selectionStart).match(/@([^\s@]*)$/), pop = $("#ch-pop");
     if (!m) { pop.hidden = true; return; }
@@ -1269,24 +1417,24 @@
     if (!e.target.closest || !e.target.closest("#ch-in, #mc")) return;
     e.preventDefault(); [...e.dataTransfer.files].forEach(upload);
   });
-  // 应用窗口里从访达拖文件进来：外壳直接给本地路径，不用复制
+  // Older native shells intercept drops before the page receives the file bytes.
   try {
     window.__TAURI__ && window.__TAURI__.event.listen("tauri://drag-drop", ev => {
       if (route.page !== "chat" && route.page !== "base") return;
-      for (const pth of (ev.payload || {}).paths || []) ui.chat.files.push({ path: pth, name: pth.split("/").pop(), image: /\.(png|jpe?g|gif|webp|heic)$/i.test(pth) });
-      paintAtt();
+      if (ev.payload?.paths?.length) toast("此窗口无法直接上传拖入的文件，请用回形针选择", "close");
     });
   } catch {}
   // 基地右侧的小聊天框：和聊天室同一套（当前频道最近几条 + 输入框）
   function paintMiniChat() {
     const el = $("#mc"); if (!el) return;
     const d = ui.chat.data;
-    if (!d) { loadChat(); return; }
+    if (!d || d.channel !== ui.chat.channel) { loadChat(false); return; }
     const ats = mentionable().filter(a => a.place === "office" || a.api).slice(0, 8);
     part("mc", el, `<div class="card-h"><h2>${icon("chat")}聊天室 <span class="muted small"># ${esc(d.channel)}</span></h2><a class="more" href="#chat">完整 ${icon("chev")}</a></div>
       <div class="mc-list" id="mc-list">${d.messages.slice(-6).map(m => msgHTML(m, true)).join("") || `<div class="empty small">@ 队员就能派活</div>`}</div>
       <div class="mc-ats">${ats.map(a => `<button data-mcat="${esc(a.name)}" title="@${esc(a.name)}">${avatar(a, 22)}</button>`).join("")}</div>
-      <div class="mc-in"><div class="ch-field"><div class="ch-att" id="mc-att"></div><textarea id="mc-text" rows="2" placeholder="@GPT 帮我…（Enter 发送，能拖文件进来）"></textarea></div><button class="btn primary sm" id="mc-send">${icon("chev")}</button></div>`);
+      <div class="mc-in"><div class="ch-field"><div class="ch-att" id="mc-att"></div><textarea id="mc-text" rows="2" placeholder="@GPT 帮我…"></textarea><label class="ib ch-clip" title="添加附件">📎<input type="file" multiple id="mc-file" hidden></label></div><button class="btn primary sm" id="mc-send">${icon("chev")}</button></div>`);
+    const ta = $("#mc-text"); if (ta && ta.value !== chatDraft().text) ta.value = chatDraft().text;
     const l = $("#mc-list"); if (l) l.scrollTop = 1e9;
     paintAtt();
   }

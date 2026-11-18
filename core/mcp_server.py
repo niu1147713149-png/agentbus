@@ -15,11 +15,19 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import quota  # noqa: E402
 from catalog import LEVELS  # noqa: E402
-from config import HOME, agents_dict, bill, load_config, project, resolve_tag, save_config, who  # noqa: E402
+from config import HOME, agent_of_client, agents_dict, bill, load_config, load_json, project, resolve_tag, save_config, save_json, update_json, who, whoami  # noqa: E402
 
 JOBS = HOME / "jobs"
 CLI = HERE / "agentbus.py"
 URL = "http://127.0.0.1:" + (os.environ.get("AGENTBUS_PORT") or "8790")
+
+
+def _ui_hint(agent):
+    if agent == "codex":
+        return "不要自动打开浏览器或应用窗口；只有用户明确要求打开界面时才打开。"
+    return (f"界面：{URL}——如果你有内置浏览器（Claude 桌面端：preview_start 传 url），现在就打开它给主人看进度。"
+            "视口用跟随面板宽度的响应式（不要固定成 1280×720 之类的桌面尺寸再缩放），页面会按面板实际宽度自己排版。")
+
 
 TOOLS = [
     {"name": "agentbus_status", "description": "看办公室：谁在岗、谁在休息室、谁在干活、手上什么活、挂了什么岗位。",
@@ -37,7 +45,7 @@ TOOLS = [
     {"name": "agentbus_move", "description": "把 agent 调进办公室（office，上岗）或休息室（lounge）。",
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string"}, "place": {"type": "string", "enum": ["office", "lounge"]}},
                      "required": ["agent", "place"]}},
-    {"name": "agentbus_dispatch", "description": "派活：agent 填名字或岗位词条（按偏好自动挑人；Claude 不接派活）。后台运行，立刻返回 job id。"
+    {"name": "agentbus_dispatch", "description": "派活：agent 填名字或岗位词条（按偏好自动挑人；处于封印状态的队员不能接活）。后台运行，立刻返回 job id。"
                                                    "要在做完/失败时被叫醒：接着用 Bash 后台（run_in_background）跑返回里给的 `agentbus wait <job id>`，它一结束你就会收到结果，不用主人提醒。",
      "inputSchema": {"type": "object", "properties": {
          "agent": {"type": "string"}, "task": {"type": "string", "description": "一句话交代"},
@@ -64,7 +72,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "默认是你自己（当前主位）"}, "project": {"type": "string"}}}},
     {"name": "agentbus_news", "description": "看你派出去的活有没有新结果（做完 / 失败），看过的不再显示。其他 agentbus 工具的返回里也会自动附上新结果。",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "agentbus_open", "description": "打开 agentbus 办公室界面（应用窗口）。在 Claude 右侧浏览器里看就打开 http://127.0.0.1:8790 。",
+    {"name": "agentbus_open", "description": "应用户明确要求打开 agentbus 办公室界面（应用窗口或浏览器）。不是连接或健康检查工具。",
      "inputSchema": {"type": "object", "properties": {}}},
 ]
 
@@ -166,14 +174,13 @@ def hello(args):
     import service
     s = service.state(args.get("project"))
     conv = os.environ.get("AGENTBUS_CONV") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
-    from config import mounted_packs, whoami
+    from config import mounted_packs
     me = whoami() or s["lead"] or "claude"
     cwd = os.environ.get("AGENTBUS_CWD") or os.getcwd()
     office = next((o for o in s.get("offices") or [] if o["id"] == me), None)
     lineup = office["lineup"]["office"] if office else [a["id"] for a in s["agents"] if a["place"] == "office" and a["id"] != me]
     jobs_of = (office["lineup"]["jobs"] if office else {})
-    lines = [f"界面：{URL}——如果你有内置浏览器（Claude 桌面端：preview_start 传 url），现在就打开它给主人看进度。"
-             "视口用跟随面板宽度的响应式（不要固定成 1280×720 之类的桌面尺寸再缩放），页面会按面板实际宽度自己排版。",
+    lines = [_ui_hint(me),
              f"你是「{(office or {}).get('name') or (next((a['name'] for a in s['agents'] if a['id'] == me), me) + ' 办公室')}」的主位；这个窗口的项目文件夹：{cwd}（派活、记账都跟着这个文件夹走）；协同会话：{conv[:12] or '（没有窗口信息，会话按 agent 共用）'}"]
     names = {c["id"]: c["name"] for c in service.catalog()["categories"]}
     agents = {a["id"]: a for a in s["agents"]}
@@ -214,7 +221,7 @@ def hello(args):
         except Exception:
             pass
         lines.append("学到新规矩（主人新定的、踩坑总结的）：用 `agentbus lesson propose \"一句话\" --tags 职能` 提议进经验包，主人在「经验」页采纳；只写进文档的话，下次派活队员拿不到。")
-    lines.append("派活规则：用 agentbus_dispatch 或 `agentbus ask`，带上 --tag 职能（或环境变量 AGENTBUS_TAG）——会自动注入经验包那一步的做法；录屏、操控电脑的活会自动排队等屏幕。Claude 不接派活。")
+    lines.append("派活规则：用 agentbus_dispatch 或 `agentbus ask`，带上 --tag 职能（或环境变量 AGENTBUS_TAG）——会自动注入经验包那一步的做法；录屏、操控电脑的活会自动排队等屏幕。Claude 是否接活取决于队员页的封印设置。")
     lines.append("回音规则：派出去的活一定要能叫醒你——要么 Bash 后台跑 `agentbus ask …`（做完就结束），要么 agentbus_dispatch 之后 Bash 后台跑 `agentbus wait <job id>`。"
                  "不要干等、也不要等主人提醒；新结果也会附在之后任何一个 agentbus 工具的返回里。")
     from config import update_json as _uj
@@ -266,31 +273,80 @@ def start_job(args, env_extra=None, cwd=None):
     if args.get("tag"):
         cmd += ["--tag", args["tag"]]
     log = JOBS / f"{jid}.log"
-    with open(log, "w") as f:
-        p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, **pf.group_kwargs(),
-                             cwd=str(project(args.get("project"))[1]), env={**os.environ, "AGENTBUS_SELF": os.environ.get("AGENTBUS_SELF", "claude"), "AGENTBUS_CONV": _conv_full(), **(env_extra or {})})
-    (JOBS / f"{jid}.json").write_text(json.dumps({"pid": p.pid, "cmd": cmd[2:], "start": time.time()}, ensure_ascii=False))
+    meta = JOBS / f"{jid}.json"
+    root = str(project(args.get("project"))[1])
+    save_json(meta, {"pid": None, "cmd": cmd[2:], "start": time.time(), "agent": args["agent"], "status": "starting", "project": args.get("project"), "cwd": root})
+    try:
+        with open(log, "w", encoding="utf-8") as f:
+            p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, **pf.group_kwargs(),
+                                 cwd=root, env={**os.environ, "AGENTBUS_SELF": os.environ.get("AGENTBUS_SELF", "claude"), "AGENTBUS_CONV": _conv_full(), **(env_extra or {}), "AGENTBUS_JOB_ID": jid, "PYTHONIOENCODING": "utf-8"})
+        update_json(meta, lambda d: d.update(pid=p.pid))  # 保留子进程可能已经写好的结束状态
+    except Exception as e:
+        finish_job(jid, "failed", f"任务启动失败：{e}")
+        raise
     return jid
+
+
+JOB_LABELS = {"starting": "启动中", "queued": "排队中", "running": "执行中", "ok": "已完成",
+              "failed": "失败", "error": "失败", "stopped": "已停止", "stalled": "超时停止",
+              "not_started": "未开工", "interrupted": "意外中断", "unknown": "记录缺失"}
+TERMINAL_JOBS = {"ok", "failed", "error", "stopped", "stalled", "not_started", "interrupted"}
+
+
+def finish_job(jid, status, reply, run=None):
+    """保存最终状态，服务重启或进程退出后仍可查询。"""
+    if not jid:
+        return
+    update_json(JOBS / f"{jid}.json", lambda d: d.update(status=status, reply=reply, run=run, end=time.time()))
+
+
+def job_snapshot(jid):
+    """同一份状态供 MCP 和聊天室使用；兼容尚未保存最终状态的旧任务。"""
+    import pf
+    meta = load_json(JOBS / f"{jid}.json", {})
+    status, reason, progress = meta.get("status"), "", None
+    if not meta:
+        status = "unknown"
+    elif status not in TERMINAL_JOBS:
+        records = (load_json(f, {}) for f in (HOME / "running").glob("*.json"))
+        record = next((r for r in records if meta.get("pid") and r.get("pid") == meta["pid"]), {})
+        if pf.pid_alive(meta.get("pid")):
+            status = "queued" if record.get("queued") else "running" if record.get("worker") else "starting"
+            reason = record.get("queued") or (f"第 {record['retry']} 次重试" if record.get("retry") else "")
+            progress = record.get("progress")
+        elif not meta.get("pid") and time.time() - meta.get("start", 0) < 15:
+            status = "starting"
+        else:
+            log = JOBS / f"{jid}.log"
+            tail = log.read_text("utf-8", "replace")[-1000:] if log.exists() else ""
+            status = ("ok" if "[agentbus] 做完了" in tail else "stopped" if record.get("cancel") else
+                      "failed" if "[agentbus] 没做成" in tail else "interrupted")
+    return {"status": status, "label": JOB_LABELS.get(status, status), "reason": reason,
+            "reply": meta.get("reply"), "run": meta.get("run"), "cwd": meta.get("cwd"), "progress": progress}
 
 
 def job_state(jid):
     """(还在跑吗, 输出全文, 开始时间)"""
-    meta = json.loads((JOBS / f"{jid}.json").read_text())
-    alive = True
-    try:
-        os.kill(meta["pid"], 0)
-        st = subprocess.run(["ps", "-o", "stat=", "-p", str(meta["pid"])], capture_output=True, text=True).stdout.strip()
-        alive = bool(st) and not st.startswith("Z")
-    except OSError:
-        alive = False
+    import pf
+    meta = json.loads((JOBS / f"{jid}.json").read_text("utf-8"))
+    alive = pf.pid_alive(meta["pid"])
+    if alive and not pf.IS_WIN:
+        try:
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(meta["pid"])], capture_output=True, text=True).stdout.strip()
+            alive = bool(st) and not st.startswith("Z")
+        except OSError:
+            alive = False
     return alive, (JOBS / f"{jid}.log").read_text("utf-8", "ignore"), meta["start"]
 
 
 def job(args):
     alive, out, start = job_state(args["id"])
+    snap = job_snapshot(args["id"])
     mins = (time.time() - start) / 60
-    if alive:
-        return f"还在跑（{mins:.0f} 分钟）。目前输出：\n{out[-800:]}"
+    if snap["status"] in TERMINAL_JOBS:
+        return f"{snap['label']}：\n{snap.get('reply') or out[-6000:]}"
+    if alive or snap["status"] == "starting":
+        return f"{snap['label']}（{mins:.0f} 分钟）{('：' + snap['reason']) if snap['reason'] else ''}。目前输出：\n{out[-800:]}"
     # 收尾时 agentbus ask 会在输出末尾写一行「做完了 / 没做成」：按它判断，不按有没有文字猜
     tail = out[-600:]
     if "[agentbus] 做完了" in tail:
@@ -372,8 +428,8 @@ def call(name, args):
 
 
 def _announce(client):
-    """有 agent 接入：认出是谁（它就是现在的主位），告诉本地服务让悬浮窗弹出来；服务没开就把应用拉起来。"""
-    from config import agent_of_client, is_working_as_member, touch_lead, whoami
+    """通知本地服务有客户端接入；Codex 连接失败时不启动应用或浏览器。"""
+    from config import is_working_as_member
     import urllib.request
     me = agent_of_client(client) or whoami()
     if me and is_working_as_member(me):  # 被派活的队员干活时连上来的，不打招呼、不抢主位
@@ -387,6 +443,8 @@ def _announce(client):
             urllib.request.urlopen(req, timeout=2).read()
             return
         except Exception:
+            if me == "codex":
+                return
             if attempt == 0:
                 import pf
                 pf.open_agentbus()
@@ -422,8 +480,9 @@ def main():
                 res = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
                        "capabilities": {"tools": {}}, "serverInfo": {"name": "agentbus", "version": "0.1.0"},
                        "instructions": "agentbus 是本机的 agent 协作办公室。每个新对话一开始先调 agentbus_hello（不用等主人说）：它会在悬浮窗问主人这个窗口要不要接入，"
-                                       "接入了就照它返回的握手信息干活（先用你的内置浏览器打开 http://127.0.0.1:8790 给主人看进度），没接入就当没有 agentbus。"
-                                       "谁在用 agentbus 统筹谁就是主位，不用去界面里切。Claude 不接派活。"
+                                       "接入了就照它返回的握手信息干活，没接入就当没有 agentbus。"
+                                       + _ui_hint(agent_of_client(client) or whoami()) +
+                                       "谁在用 agentbus 统筹谁就是主位，不用去界面里切。Claude 是否接活取决于队员页的封印设置。"
                                        "派出去的活要能叫醒你：Bash 后台跑 `agentbus ask …`，或 agentbus_dispatch 后 Bash 后台跑 `agentbus wait <job id>`。"
                                        "做完一批活用 agentbus_bill 看真实消耗。"}
             elif method == "tools/list":

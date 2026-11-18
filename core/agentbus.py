@@ -106,7 +106,9 @@ def build_prompt(agent, name, root, bus, task, sender, pb_block=""):
     unread = inbox(bus, agent, mark=True)
     if unread:
         parts.append("## 给你的留言\n" + "\n".join(f"- [{m['t']}] {m['frm']}：{m['text']}" for m in unread))
-    others = "、".join(a for a, v in agents_dict().items() if a != agent and v.get("run"))
+    team_cfg = load_config(name)
+    team = agents_dict(team_cfg)
+    others = "、".join(a for a in team_cfg["roster"]["office"] if a != agent and team.get(a, {}).get("run") and not team[a].get("hidden"))
     import playbook as _pb
     pb_on = (bus / "playbook" / "manifest.json").exists() and _pb.equip_of(load_config(), name)["enabled"]
     lesson_hint = ("\n- 干活中发现以后值得照做的经验（踩过的坑、主人新定的规矩）：`agentbus lesson propose \"一句话经验\" --tags 岗位 --from "
@@ -123,16 +125,62 @@ def build_prompt(agent, name, root, bus, task, sender, pb_block=""):
 def _events(stdout):
     for line in stdout.splitlines():
         try:
-            yield json.loads(line)
+            event = json.loads(line)
+            if isinstance(event, dict):
+                yield event
         except json.JSONDecodeError:
             continue
 
 
 def load_json_str(s):
     try:
-        return json.loads(s)
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
-        return {}
+        return next((e for e in reversed(list(_events(s))) if e.get("type") == "result"), {})
+
+
+def _event_progress(event):
+    """只展示可核验的阶段和工具名，不展示模型的内部推理内容或工具参数。"""
+    kind = event.get("type")
+    if kind == "thread.started" or (kind == "system" and event.get("subtype") == "init"):
+        return "会话已连接，等待模型响应"
+    if kind == "turn.started":
+        return "模型已开始处理任务"
+    if kind == "stream_event":
+        inner = event.get("event") or {}
+        if inner.get("type") == "content_block_start":
+            block = inner.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                return "正在使用工具：" + str(block.get("name") or "工具")[:60]
+            return "模型正在生成回复" if block.get("type") == "text" else "模型正在处理任务"
+        if inner.get("type") == "content_block_delta":
+            return "模型正在生成回复" if (inner.get("delta") or {}).get("type") == "text_delta" else "模型正在处理任务"
+    if kind == "assistant":
+        blocks = (event.get("message") or {}).get("content") or []
+        tools = [str(b.get("name") or "工具")[:60] for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        return "正在使用工具：" + "、".join(tools) if tools else "模型已返回一段回复"
+    if kind == "user" and any(b.get("type") == "tool_result" for b in (event.get("message") or {}).get("content", []) if isinstance(b, dict)):
+        return "工具已返回，继续处理任务"
+    if kind in ("item.started", "item.completed"):
+        item = event.get("item") or {}
+        labels = {"command_execution": "执行命令", "file_change": "修改文件", "mcp_tool_call": "调用 MCP 工具", "web_search": "搜索网页"}
+        if item.get("type") in labels:
+            return labels[item["type"]] + ("完成" if kind == "item.completed" else "中")
+        return "模型已返回一段回复" if item.get("type") == "agent_message" else "模型正在处理任务"
+    if kind in ("result", "turn.completed"):
+        return "模型已返回，正在保存结果"
+    if kind in ("error", "turn.failed"):
+        return "执行器报告错误，正在收尾"
+    return None
+
+
+def _save_progress(detail):
+    if detail and _CUR.get("running"):
+        try:
+            update_json(_CUR["running"], lambda rec: rec.update(progress={"detail": detail, "updated": time.time()}))
+        except (OSError, TimeoutError):
+            pass  # 进度只是观测信息，短时文件占用不能终止正在执行的 Agent。
 
 
 class Stalled(Exception):
@@ -193,18 +241,21 @@ def _run(kind, cmd, input=None, cwd=None, env=None, capture_output=True, text=Tr
     """像 subprocess.run 一样跑 agent，但边跑边看它有没有动静：超过 idle_min 分钟没有任何新输出，
     自己的会话日志也没更新，就整组杀掉、抛 Stalled，由 cmd_ask 开新会话重试。"""
     import tempfile
+    with tempfile.TemporaryDirectory(prefix="agentbus-run-") as directory:
+        with open(Path(directory) / "stdout", "w+", encoding="utf-8") as out, open(Path(directory) / "stderr", "w+", encoding="utf-8") as err:
+            return _run_captured(kind, cmd, input, cwd, env, session, out, err)
+
+
+def _run_captured(kind, cmd, input, cwd, env, session, out, err):
     import pf
     idle_min, _ = watchdog_cfg()
     cmd = pf.resolve(cmd)
-    out = tempfile.TemporaryFile("w+", encoding="utf-8")
-    err = tempfile.TemporaryFile("w+", encoding="utf-8")
     p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                         stdout=out, stderr=err, text=True, **pf.group_kwargs())
+                         stdout=out, stderr=err, text=True, encoding="utf-8", **pf.group_kwargs())
     try:  # 从起进程那一刻就在保护里：登记途中被喊停也会把执行器整组停掉
         if _CUR.get("running"):  # 登记实际执行器的进程组：停止时连它一起停（它和外层不在同一组）
             try:
-                rec = dict(load_json(_CUR["running"], {}), worker=p.pid)
-                save_json(_CUR["running"], rec)
+                rec = update_json(_CUR["running"], lambda d: d.update(worker=p.pid, progress={"detail": "执行器已启动，等待连接", "updated": time.time()}))
                 if rec.get("cancel"):  # 登记前主人已经点了停止
                     raise KeyboardInterrupt
             except OSError:
@@ -225,12 +276,27 @@ def _run(kind, cmd, input=None, cwd=None, env=None, capture_output=True, text=Tr
         threading.Thread(target=feed, daemon=True).start()
     last, sizes = time.time(), (0, 0)
     own_log = _own_log_probe(kind, session, last)
+    offset, pending = 0, b""
+
+    def progress():
+        nonlocal offset, pending
+        # 独立文件句柄：读取进度不能改变子进程写 stdout 的文件位置。
+        with open(out.name, "rb") as stream:
+            stream.seek(offset)
+            chunk = stream.read()
+        offset += len(chunk)
+        lines = (pending + chunk).split(b"\n")
+        pending = lines.pop()
+        details = [_event_progress(e) for e in _events(b"\n".join(lines).decode("utf-8", "replace"))]
+        detail = next((d for d in reversed(details) if d), None)
+        _save_progress(detail)
     try:
         while p.poll() is None:
             time.sleep(2 if time.time() - last < 60 else 10)
             now_sizes = (os.fstat(out.fileno()).st_size, os.fstat(err.fileno()).st_size)
             if now_sizes != sizes:
                 sizes, last = now_sizes, time.time()
+                progress()
             last = max(last, own_log())
             if time.time() - last > idle_min * 60:
                 raise Stalled(f"{max(1, round((time.time() - last) / 60))} 分钟没有任何动静")
@@ -240,6 +306,7 @@ def _run(kind, cmd, input=None, cwd=None, env=None, capture_output=True, text=Tr
         raise
     out.seek(0)
     err.seek(0)
+    progress()
     return subprocess.CompletedProcess(cmd, p.returncode, out.read(), err.read())
 
 
@@ -247,10 +314,14 @@ def run_agent(agent_id, a, root, prompt, session, run_file):
     """跑一次 agent，返回 (回复文本, 新会话 id, 原始输出, token 用量)。"""
     import brains
     brain = brains.chosen(load_config(), agent_id)  # 主人给这个队员（分身）选的模型和思考强度
+    if a["run"] in ("claude", "codex") and brain.get("model") and not brain.get("effort"):
+        brain = brains.for_run(brain, brains.options(a))
     env = dict(os.environ, PWD=str(root), AGENTBUS_SELF=agent_id, AGENTBUS_DEPTH=str(int(os.environ.get("AGENTBUS_DEPTH", "0")) + 1), AGENTBUS_CONV=conv_id())
+    env.pop("AGENTBUS_JOB_ID", None)  # 执行器再派别的活时不能覆盖本单的状态
+    env.pop("AGENTBUS_CHAT_FILES", None)  # Only the dispatcher inherits the original upload references on handoff.
     kind = a["run"]
     import pf
-    if len(prompt) > pf.ARG_LIMIT and kind not in ("codex", "claude", "api"):
+    if len(prompt) > pf.ARG_LIMIT and kind not in ("codex", "claude", "codebuddy", "api"):
         # Windows 上命令行参数有长度上限：长任务书写成文件，参数里只放一句“去读它”
         pf_file = run_file.with_suffix(".prompt.md")
         pf_file.parent.mkdir(parents=True, exist_ok=True)
@@ -258,8 +329,10 @@ def run_agent(agent_id, a, root, prompt, session, run_file):
         prompt = f"完整任务书在 {pf_file}，先完整读一遍，再按里面的要求开工。"
     if kind == "codex":
         out = run_file.with_suffix(".last.md")
-        base = ["--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--json", "-o", str(out)] + brains.flags("codex", brain)
-        cmd = ["codex", "exec", "resume", session, *base, "-"] if session else ["codex", "exec", *base, "-"]
+        base = ["--skip-git-repo-check", "--json", "-o", str(out)] + brains.flags("codex", brain)
+        codex_bin = a.get("bin") or "codex"
+        prefix = [codex_bin, "--sandbox", "workspace-write", "exec"]
+        cmd = [*prefix, "resume", session, *base, "-"] if session else [*prefix, *base, "-"]
         p = _run(kind, cmd, input=prompt, cwd=root, env=env, capture_output=True, text=True, session=session)
         sid, tok, errs = session, {"input": 0, "output": 0, "cache": 0}, []
         for ev in _events(p.stdout):
@@ -332,11 +405,13 @@ def run_agent(agent_id, a, root, prompt, session, run_file):
             return str(whole["response"]).strip(), whole.get("sessionId") or session, p.stdout, tok
         return (p.stdout.strip()[-3000:] or f"（zcode 没有回复，退出码 {p.returncode}）\n{p.stderr[-2000:]}"), session, p.stdout, None
     if kind == "claude":
-        cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"] + brains.flags("claude", brain)
+        cmd = [a.get("bin") or "claude", "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-mode", "acceptEdits"] + brains.flags("claude", brain)
         if session:
             cmd += ["--resume", session]
         p = _run(kind, cmd, input=prompt, cwd=root, env=env, capture_output=True, text=True)
         res = load_json_str(p.stdout)
+        if res.get("is_error"):
+            return f"（claude 出错：{res.get('result') or res.get('subtype')}）", session, p.stdout, None
         u = res.get("usage") or {}
         tok = {"input": u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
                "output": u.get("output_tokens", 0), "cache": u.get("cache_read_input_tokens", 0),
@@ -355,14 +430,17 @@ def run_agent(agent_id, a, root, prompt, session, run_file):
         p = _run(kind, ["dsh", "--profile", "headless", prompt], cwd=root, env=env, capture_output=True, text=True)
         return (p.stdout.strip() or f"（DeepSeek Harness 没有回复，退出码 {p.returncode}）\n{p.stderr[-2000:]}"), session, p.stdout, None
     if kind == "codebuddy":
-        cmd = ["codebuddy", "-p", "-y", "--output-format", "json"]
+        cmd = [a.get("bin") or "codebuddy", *(a.get("bin_args") or []), "-p", "--permission-mode", "acceptEdits",
+               "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
         if session:
             cmd += ["--resume", session]
-        p = _run(kind, cmd + [prompt], cwd=root, env=env, capture_output=True, text=True)
+        p = _run(kind, cmd, input=prompt, cwd=root, env=env, capture_output=True, text=True)
         res = load_json_str(p.stdout)
+        if res.get("is_error"):
+            return f"（WorkBuddy 出错：{res.get('result') or res.get('subtype')}）", session, p.stdout, None
         if isinstance(res, dict) and res.get("result"):
             return res["result"], res.get("session_id", session), p.stdout, None
-        return (p.stdout.strip() or f"（WorkBuddy 没有回复，退出码 {p.returncode}）\n{p.stderr[-2000:]}"), session, p.stdout, None
+        return f"（WorkBuddy 没有回复，退出码 {p.returncode}）\n{p.stderr[-2000:]}", session, p.stdout, None
     if kind == "doubao":
         # 豆包没有官方 CLI，用我们的豆包遥控（CDP）：填进输入框 → 发送 → 等它答完 → 读回复
         js = doubao_remote()
@@ -484,6 +562,12 @@ def cmd_ask(a):
     if sk:  # 主人给这间办公室 / 这个文件夹装的 skill：只给目录和说明，用到哪个再读（不把整份塞进来）
         block += "\n\n## 这里装了这些 skill（用得上就先完整读它的 SKILL.md 再照做）\n" + "\n".join(f"- {n}：{d[:160]}（{p}/SKILL.md）" for n, d, p in sk)
     prompt = build_prompt(agent_id, name, root, bus, task, sender, block)
+    # Expand in the worker, not in the command line, job metadata, or shared channel history.
+    attachment_material = ""
+    if os.environ.get("AGENTBUS_CHAT") and os.environ.get("AGENTBUS_CHAT_FILES"):
+        import chat
+        from chat_attachments import material
+        attachment_material = material(json.loads(os.environ["AGENTBUS_CHAT_FILES"]), chat.FILES, root)
     if pb_step or pb_lessons:
         playbook.bump(pb_bus, pb_step, pb_lessons)
         print(f"[agentbus] 带上经验包：{pb_step['name'] if pb_step else '（无对应步骤）'} + {len(pb_lessons)} 条经验"
@@ -499,7 +583,8 @@ def cmd_ask(a):
     first = task.split("\n")[0][:80]
     # 先登记“在跑”（界面、agentbus wait 马上能看到），再去查额度（查余额要几秒）
     save_json(running, {"id": run_id, "agent": agent_id, "billing": billing, "project": name, "start": t0, "conv": conv[:12],
-                        "task": first, "title": (getattr(a, "title", None) or "").strip()[:40] or short_title(a.task if a.task != "-" else task), "pid": os.getpid(), "frm": sender, "tag": tag, "batch": batch, "run": run_file.name})
+                        "task": first, "title": (getattr(a, "title", None) or "").strip()[:40] or short_title(a.task if a.task != "-" else task), "pid": os.getpid(), "frm": sender, "tag": tag, "batch": batch, "run": run_file.name,
+                        "job": os.environ.get("AGENTBUS_JOB_ID"), "channel": os.environ.get("AGENTBUS_CHAT"), "cwd": str(root)})
     try:
         before = quota.snapshot(billing)
     except Exception as e:
@@ -541,7 +626,7 @@ def cmd_ask(a):
                 text = "（没开工：" + ("排队期间" if attempt == 0 else "重试前") + why + "）"
                 raise _NoStart()
             try:
-                text, sid, raw, tok = run_agent(agent_id, ag, root, prompt, session, run_file)
+                text, sid, raw, tok = run_agent(agent_id, ag, root, prompt + attachment_material, session, run_file)
                 ok = not _looks_failed(text)
                 status = "ok" if ok else "failed"
                 break
@@ -635,12 +720,15 @@ def _finish(v):
                 "settle_at": t1 + 240 if billing == "deepseek" else None, "conv": conv[:12]})
     board_add(bus, kind="reply", frm=agent_id, to=sender, text=text, run=run_file.name, tag=tag, batch=batch,
               cost=cost, seconds=round(t1 - t0), ok=ok, status=v.get("status"), conv=conv[:12])
-    if os.environ.get("AGENTBUS_CHAT"):  # 消息里 @ 来的活：回复发回群里；回复里 @ 了别人就接力派下去（有循环保护）
+    if os.environ.get("AGENTBUS_CHAT") and not os.environ.get("AGENTBUS_TALK"):  # 群聊由轮次进程统一发言，避免 @ 递归派单
         try:
             import chat
-            chat.send(os.environ["AGENTBUS_CHAT"], text if ok else f"❌ {text}", frm=agent_id, hops=int(os.environ.get("AGENTBUS_CHAT_HOPS", "0")))
+            chat.send(os.environ["AGENTBUS_CHAT"], text if ok else f"❌ {text}", frm=agent_id, hops=int(os.environ.get("AGENTBUS_CHAT_HOPS", "0")), cwd=str(v["root"]))
         except Exception as e:
             print(f"[agentbus] 回复发回群里失败：{e}", file=sys.stderr)
+    if os.environ.get("AGENTBUS_JOB_ID"):
+        import mcp_server
+        mcp_server.finish_job(os.environ["AGENTBUS_JOB_ID"], v.get("status") or ("ok" if ok else "failed"), text, run_file.name)
     print(text)
     print(f"\n[agentbus] {'做完了' if ok else '没做成'}，用时 {round((t1 - t0) / 60, 1)} 分钟；{fmt_cost(billing, cost)}", file=sys.stderr)
 
@@ -770,11 +858,8 @@ def cmd_wait(a):
 
 
 def _pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+    import pf
+    return pf.pid_alive(pid)
 
 
 def load_ledger_ids(ids):
