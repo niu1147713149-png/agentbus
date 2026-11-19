@@ -27,7 +27,7 @@ function page() {
     EventSource: class { constructor() { events = this; } },
     fetch(url, options) {
       if (url === "/api/catalog") return Promise.resolve({ json: () => ({ categories: [] }) });
-      assert.match(url, /^\/api\/chat(?:\?channel=|\/upload$|\/send$)/);
+      assert.match(url, /^\/api\/chat(?:\?channel=|\/upload$|\/send$|\/compress$)/);
       return new Promise(resolve => requests.push({ url, options, reply(data, ok = true) { resolve({ ok, json: async () => data }); } }));
     },
     addEventListener() {}, setInterval() {}, setTimeout() {}, I18N: { sync() {} },
@@ -35,8 +35,8 @@ function page() {
   };
   scope.window = scope;
   vm.runInNewContext(app, scope);
-  const push = (running, chat_rev = 1) => events.onmessage({ data: JSON.stringify({
-    project: "test", settings: { setup_done: true, tour_done: true }, offices: [], agents: [], running, chat_rev,
+  const push = (running, chat_rev = 1, compression_rev = 0) => events.onmessage({ data: JSON.stringify({
+    project: "test", settings: { setup_done: true, tour_done: true }, offices: [], agents: [], running, chat_rev, compression_rev,
   }) });
   const event = (type, target = {}, props = {}) => Promise.all(handlers.get(type).map(fn => fn({
     target: { closest: () => null, matches: () => false, ...target }, preventDefault() {}, ...props })));
@@ -94,6 +94,35 @@ test("a late response cannot replace the newly selected channel", async () => {
   requests[0].reply(snapshot());
   await flush();
   assert.match(node("#ch-bar").html, /# 产品交付/);
+});
+
+test("compression reflects server status, keeps previews escaped, and ignores late responses from other channels", async () => {
+  const { push, node, requests, click, select } = page();
+  const data = (status, eligible) => ({ ...snapshot(), usage: { eligible, summary_preview: "<decision>" },
+    compression: { status, error: "请重试" } });
+  const render = async (status, eligible) => { requests.at(-1).reply(data(status, eligible)); await flush(); };
+  push([]); await render("idle", 0);
+  const bar = node("#ch-bar");
+  assert.match(bar.html, /无需压缩/);
+  assert.match(bar.html, /&lt;decision>/);
+  await click("[data-chcompress]"); assert.equal(requests.length, 1);
+  push([], 1, 1); await render("idle", 2);
+  const pending = click("[data-chcompress]");
+  await click("[data-chcompress]");
+  assert.equal(requests.filter(r => r.url.endsWith("/compress")).length, 1);
+  assert.match(bar.html, /正在提交/);
+  requests.at(-1).reply({ status: "running" }); await flush();
+  await render("running", 2); await pending;
+  assert.match(bar.html, /正在压缩/);
+  push([], 1, 2); await render("failed", 1);
+  assert.match(bar.html, /重试压缩/); assert.match(bar.html, /请重试/);
+  push([], 1, 3); await render("done", 0);
+  assert.match(bar.html, /压缩已完成/);
+  push([], 2, 3); await render("idle", 1);
+  const late = click("[data-chcompress]"), post = requests.at(-1);
+  const switched = select("Other"); requests.at(-1).reply(snapshot("Other")); await switched;
+  post.reply({ status: "failed" }); await late;
+  assert.match(bar.html, /# Other/); assert.doesNotMatch(bar.html, /正在压缩|重试压缩/);
 });
 
 test("pending or failed attachments block sending; retry is scoped to the original channel", async () => {

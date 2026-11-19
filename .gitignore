@@ -9,3 +9,5 @@ release/
 *.bak-*
 *.bak
 ui/i18n/work/
+# 本机环境专用的说明文档，不进仓库
+docs/local-agent-setup.md

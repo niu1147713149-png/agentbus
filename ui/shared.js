@@ -80,6 +80,7 @@ if (/Windows/i.test(navigator.userAgent)) document.documentElement.classList.add
 // 主界面和悬浮窗共用的小工具：图标、头像、状态文案、数字格式。
 (function (g) {
   const P = {
+    pencil: '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>',
     pill: '<rect x="3" y="8" width="18" height="8" rx="4"/><circle cx="7.5" cy="12" r="1.6" fill="currentColor"/>',
     chat: '<path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v8a2.5 2.5 0 0 1-2.5 2.5H10l-4.5 3.5V17h0A2.5 2.5 0 0 1 4 14.5z"/><path d="M8.5 9.5h7M8.5 12.5h4.5"/>',
     office: '<path d="M4 20V8.5L12 4l8 4.5V20"/><path d="M10 20v-4h4v4"/><path d="M8.5 10.5h1.5M14 10.5h1.5M8.5 13.5h1.5M14 13.5h1.5"/><path d="M2.5 20h19"/>',

@@ -52,3 +52,7 @@ class CodexBrowserTests(unittest.TestCase):
         with patch.object(pf, "open_agentbus", return_value="opened") as launch:
             self.assertEqual(mcp_server.call("agentbus_open", {}), "opened")
             launch.assert_called_once_with()
+
+
+if __name__ == "__main__":
+    unittest.main()

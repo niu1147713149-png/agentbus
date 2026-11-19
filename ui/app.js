@@ -30,10 +30,10 @@
     es.onmessage = e => { $("#live").classList.remove("down"); onState(JSON.parse(e.data)); };
     es.onerror = () => $("#live").classList.add("down");
   }
-  const api = async (path, body) => {
+  const api = async (path, body, onError = msg => toast(msg, "close")) => {
     const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) toast(j.error || "没成功，再试一次", "close");
+    if (!r.ok) onError(j.error || "没成功，再试一次");
     return r.ok ? j : null;
   };
   async function quests(force) {
@@ -82,8 +82,9 @@
     const qn = $(`.nav[data-page="quests"]`), b = qn.querySelector(".badge");
     if (s.running.length) (b || qn.appendChild(Object.assign(document.createElement("span"), { className: "badge" }))).textContent = s.running.length; else b && b.remove();
     // 回复可能先入频道，运行记录稍后才结束。退出时再取一次最终状态，不把消失当作成功。
-    if (s.chat_rev !== ui.chatRev || endedHere) {
+    if (s.chat_rev !== ui.chatRev || s.compression_rev !== ui.compressionRev || endedHere) {
       ui.chatRev = s.chat_rev;
+      ui.compressionRev = s.compression_rev;
       if (route.page === "chat" || route.page === "base") loadChat();
       else ui.chat.data = null;
     }
@@ -180,7 +181,7 @@
     $$(".seat[data-seat]").forEach((seat, i) => {
       const a = shown[i];
       seat.classList.toggle("lead-desk", !!lead && i === 0);
-      const key = a ? JSON.stringify([a.id, a.state, a.quota_text, a.char, a.desk, S.art.desk, S.art.desk_work, (a.acts[0] || {}).plain, viewLead() === a.id]) : "empty";
+      const key = a ? JSON.stringify([a.id, a.name, a.state, a.quota_text, a.char, a.desk, S.art.desk, S.art.desk_work, (a.acts[0] || {}).plain, viewLead() === a.id]) : "empty";
       if (seat.dataset.key === key) return;
       const was = seat.dataset.agent;
       seat.dataset.key = key; seat.dataset.agent = a ? a.id : "";
@@ -366,6 +367,39 @@
     if (a.cloneable) return `<button class="btn ${sm} ghost" data-clone-new="${esc(a.id)}">${icon("plus")}分身</button>`;
     return "";
   }
+  function renameAct(a, compact = false) {
+    return a.api ? `<button type="button" class="${compact ? "cc-b" : "btn sm ghost"}" data-api-rename="${esc(a.id)}" title="修改队员名称" aria-label="修改队员名称">${icon("pencil")}${compact ? "" : "改名"}</button>` : "";
+  }
+  function renameApiMember(a) {
+    const layer = $("#layer");
+    layer.innerHTML = `<div class="sheet-bg"><form class="modal ask" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+      <h2 id="rename-title">修改队员名称</h2><label class="fld"><span>队员名字</span><input class="inp" name="name" autocomplete="off" required></label>
+      <p class="small" role="alert" hidden></p><div class="modal-act"><button class="btn ghost" type="button">取消</button><button class="btn primary" type="submit">保存</button></div></form></div>`;
+    const form = $("form", layer), input = $("input", form), cancel = $('[type="button"]', form), save = $('[type="submit"]', form), error = $('[role="alert"]', form);
+    const close = () => { if (form.isConnected) layer.innerHTML = ""; };
+    const showError = msg => { error.textContent = msg; error.hidden = false; };
+    input.value = a.name; input.focus(); input.select();
+    cancel.onclick = close;
+    form.parentElement.onclick = e => { if (e.target === form.parentElement && !save.disabled) close(); };
+    form.onkeydown = e => { if (e.key === "Escape") { e.stopPropagation(); if (!save.disabled) close(); } };
+    input.oninput = () => { error.hidden = true; };
+    form.onsubmit = async e => {
+      e.preventDefault();
+      if (save.disabled) return;
+      const name = input.value.trim();
+      if (!name || [...name].length > 48) { showError("队员名字需要 1 到 48 个字符"); input.focus(); return; }
+      if (name === a.name) return close();
+      input.readOnly = save.disabled = cancel.disabled = true;
+      try {
+        const result = await api("/api/api-agent/rename", { agent: a.id, name }, showError);
+        if (!result) return;
+        A(a.id).name = result.name;
+        if (S.names) S.names[a.id] = result.name;
+        close(); paint(); toast("队员名称已保存");
+      } catch { showError("保存失败，请检查本地服务后重试"); }
+      finally { input.readOnly = save.disabled = cancel.disabled = false; if (form.isConnected) input.focus(); }
+    };
+  }
   // 全身立绘（美术素材里那套 01_DeepSeek…）：卡片用小图，战备页用大图
   const lihui = (a, big) => a.lihui ? `<img class="lh" src="${esc(big ? a.lihui : a.lihui.replace("/lihui/", "/lihui/sm/"))}" alt="" draggable="false" loading="lazy">` : "";
   function memberCard(a) {
@@ -376,7 +410,7 @@
       <div class="mc-info"><div class="mc-top"><h3>${esc(a.name)}</h3>${a.sealed ? `<span class="pill seal" title="不接派活、不进聊天室、不查额度">🔒 封印</span>` : ""}${statePill(a)}</div><p>${esc(a.vendor || "")}${a.installed ? brainPill(a) : ""}</p>
         <div class="trs">${traits(a)}</div>
         <div class="mc-tags">${a.installed ? skillPills(a) || `<span class="small muted">还没装配职能</span>` : `<span class="small muted">${esc(a.desc || "")}</span>`}</div>
-        <div class="mc-foot">${quotaPill(a) || `<span></span>`}<span class="mc-btns">${cloneAct(a)}${act}</span></div></div></a>`;
+        <div class="mc-foot">${quotaPill(a) || `<span></span>`}<span class="mc-btns">${renameAct(a)}${cloneAct(a)}${act}</span></div></div></a>`;
   }
   // 卡片视图：一张张角色卡，头像 + 名字 + 标注，操作放角上
   function charCard(a) {
@@ -389,7 +423,7 @@
       <b class="cc-name">${esc(a.name)}</b>
       <span class="cc-brain">${a.installed && a.brain ? esc(a.brain.label) : esc(a.vendor || "")}</span>
       <div class="trs">${traits(a, 1)}</div>
-      <div class="cc-act">${cl}${act}</div></a>`;
+      <div class="cc-act">${renameAct(a, true)}${cl}${act}</div></a>`;
   }
   function pTeam() {
     ui.teamView ??= (() => { try { return localStorage.getItem("teamView") || "list"; } catch { return "list"; } })();
@@ -410,6 +444,8 @@
     painted.team = painted.teamact = null; pTeam();
   });
   document.addEventListener("click", async e => {
+    const rn = e.target.closest("[data-api-rename]");
+    if (rn) { e.preventDefault(); e.stopPropagation(); renameApiMember(A(rn.dataset.apiRename)); return; }
     const mv = e.target.closest("[data-move]"); if (!mv) return;
     e.preventDefault(); e.stopPropagation();
     const a = A(mv.dataset.id);
@@ -735,7 +771,7 @@
       ? `<button class="btn" data-move="lounge" data-id="${esc(a.id)}">${icon("sofa")}去休息室</button>` : `<button class="btn primary" data-move="office" data-id="${esc(a.id)}">${icon("star")}上阵</button>`;
     part("hero", $("#hero"), `
       <div class="hero-art" style="--c:${esc(a.color)}"><div class="hero-fig ${a.lihui ? "with-lh" : ""}">${a.lihui ? lihui(a, true) : ""}${figureHTML({ ...a, state: a.state === "off" ? "break" : a.state }, "desk")}</div>
-        <div class="hero-plate"><h1>${esc(a.name)}</h1><p>${esc(a.vendor || "")} · ${esc(a.desc || "")}</p>
+        <div class="hero-plate"><h1>${esc(a.name)}</h1>${renameAct(a)}<p>${esc(a.vendor || "")} · ${esc(a.desc || "")}</p>
           ${a.billing === "claude" ? sealPanel(a) : ""}${loginPanel(a)}${balancePanel(a)}${meterPickPanel(a)}
           <div class="row-pills">${statePill(a)}<span class="pill">${a.place === "office" ? "上阵中" : "休息室"}</span>${a.clone_of ? `<span class="pill accent">👥 分身</span>` : ""}${quotaPill(a)}</div>
           <div class="hero-act">${act}${a.installed ? (S.lead === a.id ? `<span class="pill accent">👑 主位</span>` : `<button class="btn" data-lead="${esc(a.id)}">👑 设为主位</button>`) : ""}<a class="btn ghost" href="#quests" data-qa-go="${esc(a.id)}">${icon("quests")}任务记录</a>${a.installed && a.billing !== "manual" ? `<button class="btn ghost" data-msg="${esc(a.id)}">💬 留言</button>` : ""}</div>
@@ -1201,6 +1237,7 @@
   // 设计借鉴 agentchattr（MIT）；叫醒 agent 走 agentbus 自己的派活，不需要主位。基地右侧的小聊天框用的是同一套。
   ui.chat = { channel: (() => { try { return localStorage.getItem("chatChannel") || "大厅"; } catch { return "大厅"; } })(), data: null };
   const drafts = new Map();
+  const submittingCompression = new Set();
   function chatDraft(channel = ui.chat.channel) {
     if (!drafts.has(channel)) drafts.set(channel, { text: "", entries: [], sending: false });
     return drafts.get(channel);
@@ -1253,6 +1290,8 @@
     part("chl", $("#ch-l"), `<div class="ch-lh">频道<button class="ib" data-ch-new title="新建频道">${icon("plus")}</button></div>` +
       d.channels.map(c => `<button class="ch-c ${c.name === ui.chat.channel ? "on" : ""}" data-ch="${esc(c.name)}"># ${esc(c.name)}</button>`).join(""));
     const mt = d.meta || {}, u = d.usage || {}, talk = mt.mode === "talk";
+    const status = d.compression?.status, compressing = status === "running" || submittingCompression.has(d.channel);
+    const compressionLabel = status === "running" ? "正在压缩…" : compressing ? "正在提交…" : u.eligible === 0 ? "无需压缩" : status === "failed" ? "重试压缩" : "压缩";
     const pct = Math.min(100, Math.round((u.chars || 0) / (u.compress_at || 16000) * 100));
     const dutyTxt = !d.duty_now ? "没人回（只记录）" : `${A(d.duty_now).name}${!mt.duty || mt.duty === "auto" ? "（自动）" : ""}`;
     const rule = talk ? `你说一句，${esc((d.talk_members || []).map(x => A(x).name).join("、") || "成员")} 按顺序轮流接着聊，最多 ${mt.rounds || 2} 轮；只聊不动手，要人干活就 @ 他`
@@ -1261,10 +1300,12 @@
     part("chbar", $("#ch-bar"), `<div class="chb-top"><b># ${esc(d.channel)}</b>
         <button class="chb-mode ${talk ? "talk" : ""}" data-chset title="频道设置">${talk ? "💬 群聊" : "🛠 派活"}<span>切换 ${icon("down")}</span></button>
         <span class="ch-ctx" title="给队员的上下文：压缩要点 + 最近消息（${u.budget} 字以内）；没压缩的部分到 ${u.compress_at} 字会自动压缩">上下文<i><b style="width:${pct}%"></b></i>${Math.round((u.chars || 0) / 100) / 10}k${u.compressions ? ` · 压过 ${u.compressions} 次` : ""}</span>
-        <button class="btn sm ghost" data-chcompress title="把旧消息压成要点">压缩</button>
+        <button class="btn sm ghost" data-chcompress title="把旧消息压成要点"${compressing || u.eligible === 0 ? " disabled" : ""}>${icon("skills")}${compressionLabel}</button>
         ${run.length || d.talking ? `<button class="btn sm danger" data-chstop>⏹ 停止</button>` : ""}
         <button class="ib" data-chset title="频道设置">${icon("settings")}</button></div>
       <div class="chb-rule">${rule}${d.cwd ? `<br>共同工作目录：${esc(d.cwd)}` : ""}</div>
+      ${status === "failed" ? `<div class="small" role="alert">${esc(d.compression.error)}</div>` : status === "done" ? `<div class="small muted" role="status">压缩已完成</div>` : ""}
+      ${u.summary_preview ? `<details class="ch-summary"${$("#ch-bar details")?.open ? " open" : ""}><summary>查看队员收到的摘要</summary><pre class="fs-body" data-notr>${esc(u.summary_preview)}</pre></details>` : ""}
       <div class="ch-brains">${S.agents.filter(a => a.installed && a.brain?.custom_model && (mt.members || []).includes(a.id)).map(a => `<div><span>${esc(a.name)}</span>${brainBtn(a)}</div>`).join("")}</div>`);
     const ta = $("#ch-text"); if (ta) ta.placeholder = talk ? "说一句话，大家轮流接着聊…（@ 某人 = 单独给他派活）" : "@ 队员派活，比如：@GPT 帮我找三张参考图…（不 @ 就交给值班的）";
     if (painted.chatMessages !== d.messages) {
@@ -1377,7 +1418,21 @@
     const at = e.target.closest("[data-at]"); if (at) return insertAt(at.dataset.at);
     if (e.target.closest("[data-chset]")) return chatSettings();
     if (e.target.closest("[data-chstop]")) { await api("/api/chat/stop", { channel: ui.chat.channel }); toast("停了", "close"); return loadChat(); }
-    if (e.target.closest("[data-chcompress]")) { await api("/api/chat/compress", { channel: ui.chat.channel }); toast("在压缩了，要一会儿", "check"); return; }
+    if (e.target.closest("[data-chcompress]")) {
+      const channel = ui.chat.channel, data = ui.chat.data;
+      if (!data || data.channel !== channel || data.usage?.eligible === 0 || data.compression?.status === "running" || submittingCompression.has(channel)) return;
+      submittingCompression.add(channel); paintChat();
+      try {
+        const r = await api("/api/chat/compress", { channel }, msg => { if (ui.chat.channel === channel) toast(msg, "close"); });
+        if (r && ui.chat.channel === channel) {
+          if (r.status === "noop") toast("无需压缩");
+          else if (ui.chat.data === data) { data.compression = r; paintChat(); }
+          await loadChat();
+        }
+      } catch { if (ui.chat.channel === channel) toast("未确认压缩状态，请刷新后查看", "close"); }
+      finally { submittingCompression.delete(channel); if (route.page === "chat") paintChat(); }
+      return;
+    }
     if (e.target.closest("[data-ch-new]") && !$("#ch-newname")) { // 应用窗口里 prompt() 弹不出来：就地出一个输入框
       $("#ch-l").insertAdjacentHTML("beforeend", `<input class="ch-new" id="ch-newname" placeholder="新频道名，回车建好">`);
       $("#ch-newname").focus();
@@ -1994,7 +2049,7 @@
         <div class="row"><div class="lbl"><b>没 @ 人时谁来回（默认）</b><span>自动 = 优先用便宜的 API 队员，没有就用主位办公室战备里的第一位。每个频道还能在频道设置里单独改</span></div>
           <select class="inp sm" data-chatset="duty"><option value="auto" ${st.chat.duty === "auto" ? "selected" : ""}>自动（推荐）</option><option value="none" ${st.chat.duty === "none" ? "selected" : ""}>没人回（只记录）</option></select></div>
         ${[["talk_rounds", "群聊默认几轮", "每轮每人最多说一次", 1, 3], ["talk_max", "一次群聊最多几条", "到了就收尾，防止聊个没完", 2, 30], ["talk_chars", "群聊每条最多几个字", "超出的截掉", 100, 3000],
-           ["context", "给队员的上下文最多几个字", "压缩要点 + 最近的消息，放满为止", 2000, 40000], ["compress_at", "没压缩的部分到多少字自动压缩", "用 API 队员把旧消息压成要点；没有 API 队员就截断", 4000, 100000],
+           ["context", "给队员的上下文最多几个字", "压缩要点 + 最近的消息，放满为止", 2000, 40000], ["compress_at", "没压缩的部分到多少字自动压缩", "用 API 队员分批生成摘要；不可用时保留原文", 4000, 100000],
            ["max_running", "一个频道同时最多几单在跑", "多了的不派，提示等前面做完", 1, 10], ["hops", "队员之间互相 @ 最多接力几次", "防止两个队员互相踢皮球（主人 @ 的不算）", 1, 10],
            ["max_text", "一条消息最多几个字", "超出的截掉", 500, 50000]]
           .map(([k, t, d, lo, hi]) => `<div class="row"><div class="lbl"><b>${t}</b><span>${d}</span></div><input class="inp sm num" type="number" min="${lo}" max="${hi}" value="${esc(st.chat[k])}" data-chatset="${k}"></div>`).join("")}

@@ -4,6 +4,7 @@
 适合文案、改稿、翻译、总结、审稿这类文字活；不能操控电脑、不能跑命令。
 会话存在 ~/.agentbus/api-sessions/<会话>.json，下次派活能续上。
 """
+import http.client
 import json
 import time
 import urllib.error
@@ -42,6 +43,71 @@ class ApiError(Exception):
     pass
 
 
+def _events(response, deadline):
+    """SSE data can span lines; keepalives and other SSE fields are not model output."""
+    data = []
+    for line in response:
+        if time.monotonic() >= deadline:
+            raise TimeoutError()
+        line = line.rstrip(b"\r\n")
+        if line.startswith(b"data:"):
+            data.append(line[5:].lstrip(b" "))
+        elif not line and data:
+            yield b"\n".join(data)
+            data = []
+    # An event is only committed on a blank line; EOF can cut a tool argument in half.
+
+
+def _stream_reply(response, deadline):
+    content, reasoning, calls, usage = [], [], {}, {}
+    finished, done = None, False
+    for payload in _events(response, deadline):
+        if payload == b"[DONE]":
+            done = True
+            break
+        frame = json.loads(payload)
+        if frame.get("error"):
+            raise ApiError("中转在返回流中报告错误，回复未完整；未自动重发。")
+        if frame.get("usage"):
+            usage = frame["usage"]
+        for choice in frame.get("choices") or []:
+            if choice.get("index", 0) != 0:
+                continue
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning.append(delta["reasoning_content"])
+            for chunk in delta.get("tool_calls") or []:
+                i = chunk.get("index", 0)
+                call = calls.setdefault(i, {"type": "function", "function": {"name": "", "arguments": ""}})
+                if chunk.get("id"):
+                    call["id"] = chunk["id"]
+                if chunk.get("extra_content"):  # Keep Google's per-call thought signature on the next request.
+                    call.setdefault("extra_content", {}).update(chunk["extra_content"])
+                for key in ("name", "arguments"):
+                    call["function"][key] += (chunk.get("function") or {}).get(key) or ""
+            if choice.get("finish_reason"):
+                finished = choice["finish_reason"]
+    if finished not in ("stop", "tool_calls") and not (finished is None and done and not calls):
+        raise ApiError("中转回复未完整（未收到正常结束标记），已停止，未自动重发。")
+    msg = {"role": "assistant", "content": "".join(content)}
+    if reasoning and calls:
+        msg["reasoning_content"] = "".join(reasoning)
+    if calls:
+        msg["tool_calls"] = [calls[i] for i in sorted(calls)]
+        for call in calls.values():
+            try:
+                valid = call.get("id") and call["function"]["name"] and isinstance(json.loads(call["function"]["arguments"]), dict)
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ApiError("中转返回的工具调用未完整，未执行工具，未自动重发。")
+    if not calls and not msg["content"].strip():
+        raise ApiError("中转结束了回复，但没有返回正文或工具调用。")
+    return {"choices": [{"message": msg}], "usage": usage}
+
+
 def _safe(root, rel):
     p = (Path(root) / (rel or "")).resolve()
     r = Path(root).resolve()
@@ -77,13 +143,27 @@ def _tool(root, name, args, bus=None, me=""):
 
 
 def _post(base, key, body, timeout):
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "agentbus"}
+    if body.get("stream"):
+        headers["Accept"] = "text/event-stream, application/json"
     req = urllib.request.Request(base.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "agentbus"})
+                                 headers=headers)
+    phase = "等待响应头"
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            phase = "接收回复"
+            if r.headers.get_content_type() == "text/event-stream":
+                return _stream_reply(r, started + timeout)
+            return json.load(r)
     except urllib.error.HTTPError as e:
-        raise ApiError(f"HTTP {e.code}：{e.read().decode('utf-8', 'ignore')[:400]}")
+        with e:
+            raise ApiError(f"HTTP {e.code}：{e.read(400).decode('utf-8', 'ignore')[:400]}")
+    except (OSError, http.client.HTTPException) as e:
+        raise ApiError(f"{phase}时连接失败（{type(e).__name__}，{time.monotonic() - started:.0f} 秒）。"
+                       "本轮未获得完整回包，中转可能已计费；未自动重发。") from e
+    except (UnicodeError, ValueError) as e:
+        raise ApiError("中转回包不是有效的对话数据；未自动重发。") from e
 
 
 def run(account, model, prompt, root, session=None, effort=None, timeout=600, on_step=None, bus=None, me=""):
@@ -104,6 +184,8 @@ def run(account, model, prompt, root, session=None, effort=None, timeout=600, on
     for step in range(MAX_STEPS):
         has_pb = bool(bus) and (Path(bus) / "playbook" / "manifest.json").exists()
         body = {"model": model, "messages": msgs, "tools": TOOLS + ([PROPOSE] if has_pb else [])}
+        if model.rsplit("/", 1)[-1].lower().startswith("gemini-"):
+            body.update(stream=True, stream_options={"include_usage": True})
         if effort:
             body["reasoning_effort"] = effort
         res = _post(acc["base"], key, body, max(30, t_end - time.time()))

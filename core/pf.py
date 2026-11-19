@@ -166,11 +166,11 @@ def kill_job(rec):
     return hit
 
 
-def run_tree(argv, timeout, **kw):
+def run_tree(argv, timeout, input=None, **kw):
     """像 subprocess.run(capture_output=True, text=True)，但超时时整组（连孙子进程）一起杀掉。"""
-    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, **kw, **group_kwargs())
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL, text=True, **kw, **group_kwargs())
     try:
-        out, err = p.communicate(timeout=timeout)
+        out, err = p.communicate(input=input, timeout=timeout)
     except BaseException:
         kill_tree(p)
         p.wait()

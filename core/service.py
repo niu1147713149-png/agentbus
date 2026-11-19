@@ -59,32 +59,64 @@ _lock = threading.Lock()
 
 
 _buswin = []  # 近 7 天接入过 agentbus 的窗口（后台扫，见 activity.bus_windows）
-_compressing = set()
+_compress_status = {}
+_compress_rev = 0
 _lock_compress = threading.Lock()
 _upd = {}  # 最近一次查到的新版本信息
 
 
 _loop_beat = {"t": 0}
 _compress_fail = {}  # 频道 → 上次压缩失败的时间；失败后 10 分钟内不再自动试
+_compress_seen = {}  # 频道 → 上次自动检查时的 (大小, 修改时间)；文件没变就不再重算压缩计划
 
 
-def _compress_one(ch):
-    """压一个频道；自动、手动共用同一个占用标记，失败也一定释放。返回 False = 这个频道正在压。"""
+def _compression_state(ch):
+    with _lock_compress:
+        return _compress_status.get(ch, {"status": "idle"})
+
+
+def _compression_update(ch, status, **fields):
+    global _compress_rev
+    state = _compress_status[ch] = {"status": status, **fields}
+    _compress_rev += 1
+    return state
+
+
+def _start_compression(ch, automatic=False):
     import chat
     with _lock_compress:
-        if ch in _compressing:
-            return False
-        _compressing.add(ch)
+        state = _compress_status.get(ch, {})
+        if state.get("status") == "running":
+            return state
+        if automatic and time.time() - _compress_fail.get(ch, 0) < 600:
+            return state
+        plan = chat.compression_plan(ch)
+        info = plan[0]
+        if not info["eligible"] or (automatic and info["chars"] < info["compress_at"]):
+            return {"status": "noop"}
+        if not plan[3]:
+            _compress_fail[ch] = time.time()
+            return _compression_update(ch, "failed", error="没有 API 队员可生成摘要，未处理的消息仍保留")
+        started = _compression_update(ch, "running")
+
+    def work():
+        try:
+            chat.compress(ch, force=True, plan=plan)
+        except Exception as exc:
+            with _lock_compress:
+                _compress_fail[ch] = time.time()
+                _compression_update(ch, "failed", error=str(exc) if isinstance(exc, chat.CompressionError) else "压缩中断，可重试；未完成的消息仍保留")
+        else:
+            with _lock_compress:
+                _compress_fail.pop(ch, None)
+                _compression_update(ch, "done")
     try:
-        chat.compress(ch, force=True)
-        _compress_fail.pop(ch, None)
-    except Exception as e:
-        _compress_fail[ch] = time.time()
-        print(f"压缩「{ch}」失败：", e, file=sys.stderr)
-    finally:
+        threading.Thread(target=work, daemon=True).start()
+    except RuntimeError:
         with _lock_compress:
-            _compressing.discard(ch)
-    return True
+            _compress_fail[ch] = time.time()
+            return _compression_update(ch, "failed", error="压缩未能启动，请重试")
+    return started
 
 
 def _auto_compress():
@@ -93,14 +125,19 @@ def _auto_compress():
     import chat
     if not chat.CHAT.exists():
         return
-    at = chat.lim()["compress_at"]
     for f in chat.CHAT.glob("*.jsonl"):
         ch = f.stem
         try:
-            if (not chat.valid(ch) or time.time() - f.stat().st_mtime > 900 or ch in _compressing
-                    or time.time() - _compress_fail.get(ch, 0) < 600 or chat.usage(ch)["chars"] < at):
+            st = f.stat()
+            if not chat.valid(ch) or time.time() - st.st_mtime > 900:
                 continue
-            threading.Thread(target=_compress_one, args=(ch,), daemon=True).start()
+            sig = (st.st_size, st.st_mtime_ns)
+            if _compress_seen.get(ch) == sig:  # 频道没有新消息，上次已经判断过不需要压缩
+                continue
+            _start_compression(ch, automatic=True)
+            # 只有判断过（不是正在跑、也不是失败冷却中）才记下；压缩中的频道下一轮再看。
+            if _compression_state(ch).get("status") != "running":
+                _compress_seen[ch] = sig
         except Exception as e:
             print(f"检查「{ch}」要不要压缩时出错：", e, file=sys.stderr)
 
@@ -485,6 +522,21 @@ def make_clone(base, name=None):
     return cid
 
 
+def _check_agent_name(name, taken):
+    """队员名字的唯一校验，建队员和改名共用。taken 是 {id: 名字} 里已经被占用的名字（不含本人）。"""
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 48:
+        raise ValueError("队员名字需要 1 到 48 个字符")
+    name = name.strip()
+    if not name.isprintable() or "@" in name:
+        raise ValueError("队员名字不能包含 @、换行或控制字符")
+    import chat
+    if any(chat._starts_word(name.lower(), w) for w in ("所有人", "all", "everyone")):  # 只拦真正的全员词，Allen 这类名字可以用
+        raise ValueError("这个名字会触发全员点名，请换一个")
+    if any(name.casefold() == t.casefold() for t in taken):
+        raise ValueError("名字与其他队员的名称或 ID 重复，请换一个")
+    return name
+
+
 def new_api_agent(account, model, name=None):
     import wallet
     acc = wallet.accounts().get(account)
@@ -498,10 +550,34 @@ def new_api_agent(account, model, name=None):
         n += 1
     aid = f"api-{n}"
     p = wallet.PRESETS.get(acc["provider"]) or wallet.PRESETS["custom"]
+    if (name or "").strip():
+        # 与改名一样校验：名字不能是全员点名词，也不能与现有队员的名称或 ID 重复。
+        agents = agents_dict(raw)
+        name = _check_agent_name(name, list(agents) + [a["name"] for a in agents.values()])
     api[aid] = {"name": (name or "").strip() or f"{p['name'].split('（')[0]} {model.split('/')[-1]}", "account": account, "model": model,
                 "base": acc["base"], "vendor": f"{p['name']} · API", "color": p["color"]}
     save_json(CONFIG, raw)
     return aid
+
+
+def rename_api_agent(aid, name):
+    from config import CONFIG, update_json
+
+    if not isinstance(aid, str):
+        raise ValueError("这不是 API 队员")
+
+    final = {}
+
+    def change(raw):  # update_json 会把返回值当成整份配置，所以这里不返回，名字经 final 带出去。
+        agents = agents_dict(raw)
+        agent = agents.get(aid)
+        if not agent or not agent.get("api"):
+            raise ValueError("这不是 API 队员")
+        taken = [k for k in agents if k != aid] + [a["name"] for k, a in agents.items() if k != aid]
+        final["name"] = raw["clones" if agent.get("clone_of") else "api_agents"][aid]["name"] = _check_agent_name(name, taken)
+
+    update_json(CONFIG, change)
+    return final["name"]
 
 
 def remove_api_agent(aid):
@@ -887,7 +963,7 @@ def state(project_name=None):
         "project": project_name, "project_key": current_project(), "batch": batch,
         "projects": [k for k in ps if not k.startswith("_")],
         "own_lineup": bool(cfg.get("_lineup_of")), "lead": lead_of(cfg), "playbook": playbook_brief(cfg, project_name, bus),
-        "agents": agents, "rooms": rooms, "offices": offices, "packs": pack_library() + skill_library(), "pack_mounts": pack_mounts(cfg), "scheduler": sched_brief(cfg), "hello": dict(_hello), "update": {k: _upd.get(k) for k in ("available", "latest", "current", "url", "notes", "name")} if _upd.get("available") else None, "chat_rev": max((f.stat().st_mtime for f in (HOME / "chat").glob("*.jsonl")), default=0) if (HOME / "chat").exists() else 0,
+        "agents": agents, "rooms": rooms, "offices": offices, "packs": pack_library() + skill_library(), "pack_mounts": pack_mounts(cfg), "scheduler": sched_brief(cfg), "hello": dict(_hello), "update": {k: _upd.get(k) for k in ("available", "latest", "current", "url", "notes", "name")} if _upd.get("available") else None, "compression_rev": _compress_rev, "chat_rev": max((f.stat().st_mtime for f in (HOME / "chat").glob("*.jsonl")), default=0) if (HOME / "chat").exists() else 0,
         "join_ask": sorted([x for x in _join_ask.values() if now - x["t"] < JOIN_ASK_TTL], key=lambda x: -x["t"])[:3], "platform": {"os": pf.NAME, "keystore": pf.KEYSTORE, "files": pf.FILE_MANAGER},
         "board": [{"t": r.get("t"), "kind": r.get("kind"), "frm": r.get("frm"), "to": r.get("to"), "tag": r.get("tag"),
                    "text": activity.short(r.get("text"), 90), "cost": r.get("cost"), "seconds": r.get("seconds")}
@@ -1590,7 +1666,7 @@ class Handler(SimpleHTTPRequestHandler):
             tasks = chat.running(ch)
             return self._json({"channels": chat.channels(), "channel": ch, "messages": chat.with_job_status(chat.read(ch, int(q.get("n") or 200))),
                                "meta": {k: mt.get(k) for k in ("mode", "duty", "members", "rounds", "compressions", "project", "handoff_mode", "relay_hops")}, "cwd": chat.workspace(ch)[1], "talking": bool(mt.get("talk_pid") and _alive(mt["talk_pid"])),
-                               "usage": chat.usage(ch), "talk_members": chat.talk_members(ch), "running": len(tasks),
+                               "usage": chat.usage(ch), "compression": _compression_state(ch), "talk_members": chat.talk_members(ch), "running": len(tasks),
                                "running_tasks": [{k: r.get(k) for k in ("agent", "start", "queued", "title", "progress", "cwd", "job")} for r in tasks],
                                "duty_now": chat.resolve_duty(mt.get("duty")), "limits": chat.channel_limits(ch), "max_rounds": chat.TALK_ROUNDS})
         if u.path == "/api/connectors":  # 各家 agent 的接入方式：装没装、钩子挂没挂、手动配置、接入口令
@@ -1775,10 +1851,7 @@ class Handler(SimpleHTTPRequestHandler):
         if u.path == "/api/chat/compress":  # 手动压缩上下文（后台跑，要一会儿）
             import chat
             ch = data.get("channel") or "大厅"
-            if ch in _compressing:
-                return self._json({"ok": True, "busy": True})
-            threading.Thread(target=_compress_one, args=(ch,), daemon=True).start()
-            return self._json({"ok": True})
+            return self._json(_start_compression(ch))
         if u.path == "/api/chat/channel":  # 新建频道
             import chat
             name = (data.get("name") or "").strip().replace("/", "／").replace("\\", "＼")[:30]
@@ -2001,6 +2074,8 @@ class Handler(SimpleHTTPRequestHandler):
                     wallet.update(data.get("id", ""), limit=data.get("limit"), name=data.get("name"))
                 elif u.path == "/api/api-agent/new":
                     r["id"] = new_api_agent(data.get("account", ""), data.get("model", ""), data.get("name"))
+                elif u.path == "/api/api-agent/rename":
+                    r["name"] = rename_api_agent(data.get("agent"), data.get("name"))
                 elif u.path == "/api/api-agent/remove":
                     remove_api_agent(data.get("agent", ""))
                 else:
