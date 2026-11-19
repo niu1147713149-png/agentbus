@@ -44,6 +44,36 @@ class ChatCompression(unittest.TestCase):
             service._auto_compress()
             self.assertEqual(start.call_count, 2)
 
+    def test_switching_project_does_not_leak_old_context(self):
+        # 频道从项目 A 切到 B：B 的队员不应该看到 A 的原话和摘要。
+        chat.set_meta(self.ch, project="A")
+        self.add("这是项目A的原话：请做A的登录页")
+        chat.set_meta(self.ch, summary="项目A摘要：登录页用 OAuth", summary_upto=None)
+        chat.switch_project(self.ch, "B")
+        self.add("请做B的首页")
+        ctx = chat.context(self.ch)
+        self.assertNotIn("项目A", ctx)
+        self.assertIn("请做B的首页", ctx)
+        self.assertEqual(chat.meta(self.ch).get("project"), "B")
+        # 旧消息仍在聊天记录里，只是不再注入
+        self.assertIn("项目A的原话", "".join(m["text"] for m in chat.read(self.ch, 50)))
+
+    def test_switching_to_same_project_keeps_context(self):
+        chat.set_meta(self.ch, project="A")
+        self.add("还在项目A")
+        chat.switch_project(self.ch, "A")
+        self.assertIn("还在项目A", chat.context(self.ch))
+
+    def test_send_reports_agents_rejected_when_channel_is_full(self):
+        # 频道已满载：@ 的队员没派出去，接口要能告诉调用方，而不是只返回“消息已发送”。
+        rejected = []
+        with patch.object(chat, "running", return_value=[{}, {}, {}]),              patch.object(chat, "dispatch", side_effect=AssertionError("should not dispatch")):
+            agents = {"api-test": {"name": "Test", "run": "api", "billing": "api", "api": True}}
+            jobs = chat._dispatch_all(self.ch, ["api-test"], agents, "@Test 写文案", "user", 0, None, None,
+                                      {"max_running": 3}, rejected)
+        self.assertEqual(jobs, [])
+        self.assertEqual(rejected, ["api-test"])
+
     def test_short_channel_over_budget_and_one_long_message(self):
         for i in range(7):
             self.add(str(i) * 2500)

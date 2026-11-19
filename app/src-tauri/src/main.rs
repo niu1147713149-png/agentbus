@@ -13,14 +13,24 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 
 const ADDR: &str = "127.0.0.1:8790";
 const URL: &str = "http://127.0.0.1:8790/";
 
 fn http_get(path: &str) -> Option<String> {
+    request("GET", path)
+}
+
+/// 会停服务这类改动状态的请求用 POST：GET 可能被别的网页用 <img> 等方式触发。
+fn http_post(path: &str) -> Option<String> {
+    request("POST", path)
+}
+
+fn request(method: &str, path: &str) -> Option<String> {
     let mut s = TcpStream::connect_timeout(&ADDR.parse().ok()?, Duration::from_millis(400)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(s, "GET {path} HTTP/1.0\r\nHost: {ADDR}\r\n\r\n").ok()?;
+    write!(s, "{method} {path} HTTP/1.0\r\nHost: {ADDR}\r\nContent-Length: 0\r\n\r\n").ok()?;
     let mut buf = String::new();
     s.read_to_string(&mut buf).ok()?;
     buf.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
@@ -71,6 +81,37 @@ fn no_window(cmd: &mut Command) {
 }
 #[cfg(not(windows))]
 fn no_window(_cmd: &mut Command) {}
+
+/// 退出前问一句：只关界面（服务继续在后台跑，命令行和 Claude 还能连），还是连本地服务一起停。
+/// 对话框是异步的，选择结果在回调里处理，不卡菜单线程。
+const QUIT_UI_ONLY: &str = "只退出界面";
+const QUIT_ALL: &str = "停止服务并退出";
+const QUIT_CANCEL: &str = "取消";
+
+fn ask_quit(app: &AppHandle) {
+    let handle = app.clone();
+    app.dialog()
+        .message("服务在后台还会继续跑（自动压缩、派活、Claude 和命令行都依赖它）。要怎么退出？")
+        .title("退出 agentbus")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::YesNoCancelCustom(
+            QUIT_UI_ONLY.into(),
+            QUIT_ALL.into(),
+            QUIT_CANCEL.into(),
+        ))
+        .show_with_result(move |choice| {
+            // 自定义文字的按钮返回的是 Custom(文字)，不是 Yes/No，所以按文字判断。
+            match choice {
+                MessageDialogResult::Custom(label) if label == QUIT_UI_ONLY => handle.exit(0),
+                MessageDialogResult::Custom(label) if label == QUIT_ALL => {
+                    let _ = http_post("/api/shutdown");
+                    std::thread::sleep(Duration::from_millis(600));
+                    handle.exit(0);
+                }
+                _ => {} // 取消，或者直接关掉对话框：什么都不做
+            }
+        });
+}
 
 /// 服务没开就开一个。服务单独跑（不跟着应用退出），Claude 的浏览器和命令行随时能连。
 fn ensure_service(app: &AppHandle) {
@@ -346,6 +387,7 @@ fn working_count(body: &str) -> usize {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![hud_resize, hud_front, hud_visible, open_main, hud_pos, hud_place, hud_snap, hud_through])
         .setup(|app| {
             // 只在菜单栏和悬浮窗里出现，不占 Dock
@@ -415,11 +457,11 @@ fn main() {
                         }
                     }
                     "restart" => {
-                        let _ = http_get("/api/shutdown"); // 让服务自己退出（各平台都一样）
+                        let _ = http_post("/api/shutdown"); // 让服务自己退出（各平台都一样）
                         std::thread::sleep(Duration::from_millis(800));
                         ensure_service(app);
                     }
-                    "quit" => app.exit(0),
+                    "quit" => ask_quit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, e| {

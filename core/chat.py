@@ -40,6 +40,16 @@ def meta(channel):
     return {"mode": "work", "duty": lim()["duty"], "members": [], "rounds": lim()["talk_rounds"], "summary": "", "summary_upto": None, "compressions": 0, **m}
 
 
+def switch_project(channel, project):
+    """频道换项目：旧项目的原话和摘要不能再给新项目的队员看。切换点记成当前最后一条消息，之后只带切换后的内容；
+    旧消息仍留在聊天记录里，只是不再注入上下文。换成同一个项目则什么都不动。"""
+    if (meta(channel).get("project") or "") == (project or ""):
+        return
+    rows = read(channel, 1)
+    last = rows[-1].get("id") if rows else None
+    set_meta(channel, project=project, summary="", summary_upto=last, summary_pos=None, summary_upto_t=None)
+
+
 def set_meta(channel, **kw):
     from config import update_json
     CHAT.mkdir(parents=True, exist_ok=True)
@@ -360,7 +370,7 @@ def handoff_targets(channel, text, frm, cfg):
     return [aid]
 
 
-def send(channel, text, frm="user", hops=0, cwd=None, files=None):
+def send(channel, text, frm="user", hops=0, cwd=None, files=None, rejected=None):
     """发一条消息。派活模式：@ 到的队员各派一单（没 @ 人就交给值班的）；群聊模式：主人一句话，队员轮流接着聊。
     返回 (消息, [派出去的 job id])。"""
     project_name, cwd = workspace(channel, cwd)
@@ -391,7 +401,7 @@ def send(channel, text, frm="user", hops=0, cwd=None, files=None):
             return msg, jobs
     from config import locked
     with locked("chat-" + conv_of(channel)):  # 同一个频道的准入和派活排队做：几条消息同时到也不会超出并发上限
-        return msg, _dispatch_all(channel, who, agents, text, frm, hops, cwd, files, L)
+        return msg, _dispatch_all(channel, who, agents, text, frm, hops, cwd, files, L, rejected)
 
 
 def _wait_registered(jid, timeout=6):
@@ -408,7 +418,8 @@ def _wait_registered(jid, timeout=6):
         time.sleep(0.2)
 
 
-def _dispatch_all(channel, who, agents, text, frm, hops, cwd, files, L):
+def _dispatch_all(channel, who, agents, text, frm, hops, cwd, files, L, rejected=None):
+    """派出去的单子 id 列表。满载没派的队员 id 会追加进 rejected（传了列表才记），让调用方能分清“派了”和“没派”。"""
     jobs = []
     busy = len(running(channel))
     for aid in who:
@@ -426,6 +437,8 @@ def _dispatch_all(channel, who, agents, text, frm, hops, cwd, files, L):
             continue
         if busy >= L["max_running"]:
             append(channel, "agentbus", f"⏳ 这个频道已经有 {busy} 单在跑（上限 {L['max_running']}），{a.get('name', aid)} 这单没派，等前面的做完再 @ 一次。", system=True)
+            if rejected is not None:
+                rejected.append(aid)
             continue
         jid = dispatch(channel, aid, text, frm, hops, cwd, files)
         jobs.append(jid)

@@ -1555,7 +1555,7 @@ class Handler(SimpleHTTPRequestHandler):
         return self._guard(self._do_get)
 
     # 读主人凭证 / 改东西的 GET 也要确认是本机同一个用户发的
-    _PEER_GET = ("/api/wallet", "/api/connectors", "/api/chat/file", "/api/shutdown", "/api/hudlog", "/api/brain", "/api/setup")
+    _PEER_GET = ("/api/wallet", "/api/connectors", "/api/chat/file", "/api/hudlog", "/api/brain", "/api/setup")
 
     def _peer_ok(self):
         """连接对面必须是同一个系统用户的程序（挡住同一台电脑上的其他用户）。查不了的平台照常放行。"""
@@ -1711,10 +1711,6 @@ class Handler(SimpleHTTPRequestHandler):
             except OSError:
                 pass
             return self._json({"ok": True})
-        if u.path == "/api/shutdown":  # 应用菜单“重启本地服务”用（只听本机）
-            self._json({"ok": True})
-            threading.Thread(target=lambda: (time.sleep(0.3), _server and _server.shutdown()), daemon=True).start()
-            return
         if u.path == "/api/health":
             return self._json({"ok": True, "app": "agentbus", "loop_age": round(time.time() - _loop_beat["t"]) if _loop_beat["t"] else None})
         return super().do_GET()
@@ -1746,6 +1742,10 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._allowed():
             return self._deny()
         u = urlparse(self.path)
+        if u.path == "/api/shutdown":  # 应用菜单“重启本地服务”用（只听本机）。会停服务，所以用 POST，不能用 GET 触发。
+            self._json({"ok": True})
+            threading.Thread(target=lambda: (time.sleep(0.3), _server and _server.shutdown()), daemon=True).start()
+            return
         if u.path == "/api/chat/upload":  # 保留原始字节；发送时用此引用绑定附件
             import chat
             from urllib.parse import unquote
@@ -1819,9 +1819,11 @@ class Handler(SimpleHTTPRequestHandler):
                     managed_upload(x["path"], chat.FILES)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 return self._json({"error": "附件不可用，请用回形针重新选择文件"}, 400)
-            msg, jobs = chat.send(data.get("channel") or "大厅", text, cwd=data.get("cwd") or None, files=files)
+            rejected = []
+            msg, jobs = chat.send(data.get("channel") or "大厅", text, cwd=data.get("cwd") or None, files=files, rejected=rejected)
             _cache.clear()
-            return self._json({"ok": True, "message": msg, "jobs": jobs})
+            # ok 只表示消息已发到频道；rejected 里是 @ 了但因为频道满载没派出去的队员，调用方要据此重试。
+            return self._json({"ok": True, "message": msg, "jobs": jobs, "rejected": rejected})
         if u.path == "/api/chat/settings":  # 频道设置：模式（派活 / 群聊）、值班的人、群聊成员和轮数
             import chat
             ch = data.get("channel") or "大厅"
@@ -1833,7 +1835,10 @@ class Handler(SimpleHTTPRequestHandler):
             old = chat.meta(ch)
             if "project" in kw and kw["project"] != (old.get("project") or "") and (chat.running(ch) or (old.get("talk_pid") and _alive(old["talk_pid"]))):
                 return self._json({"error": "本频道仍在执行，请结束后再切换项目文件夹"}, 409)
-            chat.set_meta(ch, **kw)
+            if "project" in kw:
+                chat.switch_project(ch, kw.pop("project"))
+            if kw:
+                chat.set_meta(ch, **kw)
             if kw.get("mode") and kw["mode"] != old.get("mode"):  # 切了模式：在群里说清楚之后会怎样
                 names = {k: v.get("name", k) for k, v in agents_dict(load_config()).items()}
                 if kw["mode"] == "talk":

@@ -8,6 +8,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-dialog = "2.8.4"
 
 [profile.release]
 opt-level = "s"

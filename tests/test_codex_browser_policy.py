@@ -69,8 +69,14 @@ class CreditsGate(unittest.TestCase):
     def test_exhausted_quota_is_blocked(self):
         self.assertIn("额度用完", self.block({"ok": True, "weekly": 100, "five_hour": 3, "updated": self.NOW}))
 
-    def test_unreadable_quota_is_blocked(self):
-        self.assertIn("没法确认", self.block({"ok": False, "error": "opencodex 没开"}))
+    def test_unreadable_quota_is_allowed_but_flagged(self):
+        # 没有 opencodex 也没有缓存（比如直连 Codex 的机器）：没有数据就无从判断，不拦；由收尾时提示可能扣费。
+        q = {"ok": False, "error": "opencodex 没开"}
+        self.assertIsNone(self.block(q))
+        import agentbus
+        self.assertIn("没有读到 GPT 额度", agentbus._credits_unknown("codex", q))
+        self.assertIsNone(agentbus._credits_unknown("codex", {"ok": True, "weekly": 1, "updated": self.NOW}))
+        self.assertIsNone(agentbus._credits_unknown("deepseek", {"ok": False}))
 
     def test_stale_cache_is_blocked_even_when_it_looks_low(self):
         q = {"ok": True, "stale": True, "weekly": 40, "five_hour": 40, "updated": self.NOW - 3 * 86400}

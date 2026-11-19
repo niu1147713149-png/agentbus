@@ -282,11 +282,14 @@ def create_project(name, root=None, brief="", copy_lineup=True):
         raise ValueError("项目名不能为空，也不能叫“通用”或带斜杠")
     if name in ps:
         raise ValueError(f"已经有项目「{name}」了")
+    folder = Path(os.path.expanduser(root or "~")).resolve()
+    if not folder.is_dir():
+        raise ValueError(f"项目文件夹不存在或不是文件夹：{folder}。请先把仓库克隆或放到这个位置，再新建项目。")
     bus = HOME / "projects" / name
     (bus / "runs").mkdir(parents=True, exist_ok=True)
     (bus / "roles").mkdir(exist_ok=True)
     (bus / "brief.md").write_text(brief.strip() + "\n" if brief.strip() else f"## 项目说明：{name}\n\n（写给所有 agent 看的共同规矩：目标、文件夹、红线。）\n", "utf-8")
-    ps[name] = {"root": str(Path(os.path.expanduser(root or "~")).resolve()), "bus": str(bus)}
+    ps[name] = {"root": str(folder), "bus": str(bus)}
     update_json(PROJECTS, lambda d: d.__setitem__(name, ps[name]))
     base = load_config()  # 当前项目的阵容
     lu = {"roster": copy.deepcopy(base["roster"]), "jobs": copy.deepcopy(base["jobs"])} if copy_lineup else \

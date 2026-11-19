@@ -497,14 +497,14 @@ CREDITS_FRESH_SECS = 600
 
 
 def _credits_block(billing, q, allow, now=None):
-    """GPT 额度用完、或者没法确认还有额度时，拒绝派活（再派会扣付费 credits）。
-    读不到额度、或只有过期缓存，也拒绝：不能确认就不算“额度还在”。--allow-credits 明确放行。"""
+    """GPT 额度已经用完，或者读数已过期，就拒绝派活（再派会扣付费 credits）。
+    读不到额度（没有 opencodex 也没有缓存）不拦：没有数据就无从判断，这种情况放行，由 _credits_unknown() 提示。
+    --allow-credits 明确放行一切。"""
     if billing != "codex" or allow:
         return None
     now = time.time() if now is None else now
     if not q.get("ok"):
-        return ("没法确认 GPT 额度（" + (q.get("error") or "读取失败") + "），为免扣付费 credits 先不派。"
-                "确定要用就加 --allow-credits，或者换别的 agent。")
+        return None
     stale = q.get("stale") or now - (q.get("updated") or 0) > CREDITS_FRESH_SECS
     if stale:
         return ("GPT 额度读数已过期（" + time.strftime("%m-%d %H:%M", time.localtime(q.get("updated") or 0)) + "），"
@@ -513,6 +513,13 @@ def _credits_block(billing, q, allow, now=None):
         return (f"GPT 额度用完了（本周 {q.get('weekly')}%、5 小时 {q.get('five_hour')}%），再派会扣付费 credits"
                 f"（现在 {q.get('credits')}）。确定要用就加 --allow-credits，或者换别的 agent。")
     return None
+
+
+def _credits_unknown(billing, q):
+    """读不到 GPT 额度时给主人的提示文字；能读到额度就返回 None。"""
+    if billing != "codex" or q.get("ok"):
+        return None
+    return "（没有读到 GPT 额度，" + (q.get("error") or "来源不可用") + "；这单可能扣付费 credits）"
 
 
 def cmd_ask(a):
@@ -712,6 +719,8 @@ def _finish(v):
         after, cost = {"ok": False}, {"ok": False, "note": f"额度没查到：{e}"}
     if v["others"] and cost.get("ok"):
         cost["note"] = "同时还有别的活在用同一个额度，单条数字偏大；账单里会合并计算"
+    if not cost.get("ok") and _credits_unknown(billing, v["before"]) and _credits_unknown(billing, after):
+        text = text + "\n\n" + _credits_unknown(billing, after)
     if tok:
         tok["total"] = sum(x for k, x in tok.items() if k in ("input", "output", "cache") and isinstance(x, int))
     if sid:
