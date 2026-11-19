@@ -492,6 +492,29 @@ def fmt_cost(billing, c):
     return ""
 
 
+# 额度读数超过这么久就不算“现在的”了：opencodex 不通时退回的缓存可能是几天前的。
+CREDITS_FRESH_SECS = 600
+
+
+def _credits_block(billing, q, allow, now=None):
+    """GPT 额度用完、或者没法确认还有额度时，拒绝派活（再派会扣付费 credits）。
+    读不到额度、或只有过期缓存，也拒绝：不能确认就不算“额度还在”。--allow-credits 明确放行。"""
+    if billing != "codex" or allow:
+        return None
+    now = time.time() if now is None else now
+    if not q.get("ok"):
+        return ("没法确认 GPT 额度（" + (q.get("error") or "读取失败") + "），为免扣付费 credits 先不派。"
+                "确定要用就加 --allow-credits，或者换别的 agent。")
+    stale = q.get("stale") or now - (q.get("updated") or 0) > CREDITS_FRESH_SECS
+    if stale:
+        return ("GPT 额度读数已过期（" + time.strftime("%m-%d %H:%M", time.localtime(q.get("updated") or 0)) + "），"
+                "不能确认还有额度，为免扣付费 credits 先不派。确定要用就加 --allow-credits，或者换别的 agent。")
+    if max(q.get("weekly") or 0, q.get("five_hour") or 0) >= 100:
+        return (f"GPT 额度用完了（本周 {q.get('weekly')}%、5 小时 {q.get('five_hour')}%），再派会扣付费 credits"
+                f"（现在 {q.get('credits')}）。确定要用就加 --allow-credits，或者换别的 agent。")
+    return None
+
+
 def cmd_ask(a):
     if int(os.environ.get("AGENTBUS_DEPTH", "0")) >= MAX_DEPTH:
         sys.exit("派活层数到顶了，这件事请自己做完或在回复里交给总指挥。")
@@ -590,13 +613,9 @@ def cmd_ask(a):
     except Exception as e:
         before = {"ok": False, "error": str(e)}
     # 额度用完后 opencodex 会转去扣付费 credits：没有明确允许就不派
-    def credits_block(q):
-        if billing == "codex" and q.get("ok") and not a.allow_credits and max(q.get("weekly") or 0, q.get("five_hour") or 0) >= 100:
-            return (f"GPT 额度用完了（本周 {q.get('weekly')}%、5 小时 {q.get('five_hour')}%），再派会扣付费 credits"
-                    f"（现在 {q.get('credits')}）。确定要用就加 --allow-credits，或者换别的 agent。")
-    if credits_block(before):
+    if why := _credits_block(billing, before, getattr(a, "allow_credits", False)):
         running.unlink(missing_ok=True)
-        sys.exit(credits_block(before))
+        sys.exit(why)
     save_json(running, dict(load_json(running, {}), before=_slim(before)))
     board_add(bus, kind="task", frm=sender, to=agent_id, text=task, run=run_file.name, tag=tag, batch=batch, conv=conv[:12])
     print(f"[agentbus] {sender} → {agent_id}（{'续上次会话' if session else '新会话'}）开始 {now()}", file=sys.stderr, flush=True)
@@ -617,9 +636,9 @@ def cmd_ask(a):
             cfg2 = load_config(name)
             if _sealed(agents_dict(cfg2).get(agent_id) or ag, cfg2):
                 return f"{ag['name']} 已被封印，这单没开工"
-            if billing == "codex" and not a.allow_credits:
+            if billing == "codex":
                 q = before if attempt == 0 else quota.snapshot(billing, refresh=True)
-                return credits_block(q)
+                return _credits_block(billing, q, getattr(a, "allow_credits", False))
         for attempt in range(retries + 1):
             why = admit(attempt)
             if why:
